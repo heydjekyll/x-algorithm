@@ -329,9 +329,10 @@ impl pb::scored_posts_service_server::ScoredPostsService for ScoredPostsServer {
             .await?;
         let RequestContext {
             b3_info,
-            query,
+            mut query,
             root_span,
         } = ctx;
+        query.return_backbone_scores = true;
         let output = self.run_pipeline(query).instrument(root_span).await?;
 
         let debug_json = build_debug_json(&output.pipeline_result);
@@ -386,7 +387,7 @@ impl pb::for_you_feed_service_server::ForYouFeedService for ForYouFeedServer {
         &self,
         request: Request<pb::ForYouFeedQuery>,
     ) -> Result<Response<ForYouFeedUrtResponse>, Status> {
-        let polling_header = strato_context::is_polling(request.metadata());
+        let strato_ctx = strato_context::parse(request.metadata()).unwrap_or_default();
         let b3_info = extract_b3_info(request.metadata());
         let feed_query = request.into_inner();
         let proto_query = feed_query
@@ -394,7 +395,7 @@ impl pb::for_you_feed_service_server::ForYouFeedService for ForYouFeedServer {
             .ok_or_else(|| Status::invalid_argument("query must be specified"))?;
         let cursor_str = proto_query.cursor.clone();
         let request_context = proto_query.request_context.clone();
-        let is_polling = polling_header || proto_query.is_polling;
+        let is_polling = strato_ctx.is_polling || proto_query.is_polling;
         let ctx = self
             .query_builder
             .build(
@@ -413,6 +414,8 @@ impl pb::for_you_feed_service_server::ForYouFeedService for ForYouFeedServer {
 
         query.request_context = request_context;
         query.is_polling = is_polling;
+        query.mobile_device_id = strato_ctx.mobile_device_id;
+        query.mobile_device_ad_id = strato_ctx.ad_id;
         if !cursor_str.is_empty() {
             match cursor_utils::decode_ordered_cursor(&cursor_str) {
                 Ok(Some(c)) => {
@@ -461,9 +464,10 @@ impl pb::for_you_feed_service_server::ForYouFeedService for ForYouFeedServer {
             .await?;
         let RequestContext {
             b3_info,
-            query,
+            mut query,
             root_span,
         } = ctx;
+        query.return_backbone_scores = true;
         let output = self.get_for_you_feed(query).instrument(root_span).await?;
 
         let mut response = Response::new(ForYouFeedResponse {
@@ -478,7 +482,7 @@ impl pb::for_you_feed_service_server::ForYouFeedService for ForYouFeedServer {
         &self,
         request: Request<pb::DebugForYouFeedQuery>,
     ) -> Result<Response<ForYouFeedUrtResponse>, Status> {
-        let polling_header = strato_context::is_polling(request.metadata());
+        let strato_ctx = strato_context::parse(request.metadata()).unwrap_or_default();
         let mut b3_info = extract_b3_info(request.metadata());
         b3_info.force_sample();
 
@@ -489,7 +493,7 @@ impl pb::for_you_feed_service_server::ForYouFeedService for ForYouFeedServer {
             .ok_or_else(|| Status::invalid_argument("query must be specified"))?;
         let cursor_str = proto_query.cursor.clone();
         let request_context = proto_query.request_context.clone();
-        let is_polling = polling_header || proto_query.is_polling;
+        let is_polling = strato_ctx.is_polling || proto_query.is_polling;
         let ctx = self
             .query_builder
             .build(
@@ -506,8 +510,11 @@ impl pb::for_you_feed_service_server::ForYouFeedService for ForYouFeedServer {
             root_span,
         } = ctx;
 
+        query.return_backbone_scores = true;
         query.request_context = request_context;
         query.is_polling = is_polling;
+        query.mobile_device_id = strato_ctx.mobile_device_id;
+        query.mobile_device_ad_id = strato_ctx.ad_id;
         if !cursor_str.is_empty() {
             match cursor_utils::decode_ordered_cursor(&cursor_str) {
                 Ok(Some(c)) => {
@@ -541,7 +548,7 @@ impl pb::ranked_following_feed_service_server::RankedFollowingFeedService
         &self,
         request: Request<pb::RankedFollowingFeedQuery>,
     ) -> Result<Response<RankedFollowingFeedUrtResponse>, Status> {
-        let polling_header = strato_context::is_polling(request.metadata());
+        let strato_ctx = strato_context::parse(request.metadata()).unwrap_or_default();
         let b3_info = extract_b3_info(request.metadata());
         let feed_query = request.into_inner();
         let proto_query = feed_query
@@ -549,7 +556,7 @@ impl pb::ranked_following_feed_service_server::RankedFollowingFeedService
             .ok_or_else(|| Status::invalid_argument("query must be specified"))?;
         let cursor_str = proto_query.cursor.clone();
         let request_context = proto_query.request_context.clone();
-        let is_polling = polling_header || proto_query.is_polling;
+        let is_polling = strato_ctx.is_polling || proto_query.is_polling;
         let ctx = self
             .query_builder
             .build(
@@ -569,6 +576,8 @@ impl pb::ranked_following_feed_service_server::RankedFollowingFeedService
         query.in_network_only = true;
         query.request_context = request_context;
         query.is_polling = is_polling;
+        query.mobile_device_id = strato_ctx.mobile_device_id;
+        query.mobile_device_ad_id = strato_ctx.ad_id;
         if !cursor_str.is_empty() {
             match cursor_utils::decode_ordered_cursor(&cursor_str) {
                 Ok(Some(c)) => {
@@ -620,6 +629,7 @@ impl pb::ranked_following_feed_service_server::RankedFollowingFeedService
             mut query,
             root_span,
         } = ctx;
+        query.return_backbone_scores = true;
         query.in_network_only = true;
         let output = self
             .get_ranked_following_feed(query)
@@ -641,7 +651,7 @@ impl pb::following_feed_service_server::FollowingFeedService for FollowingFeedSe
         &self,
         request: Request<pb::FollowingFeedQuery>,
     ) -> Result<Response<FollowingFeedUrtResponse>, Status> {
-        let polling_header = strato_context::is_polling(request.metadata());
+        let strato_ctx = strato_context::parse(request.metadata()).unwrap_or_default();
         let b3_info = extract_b3_info(request.metadata());
         let feed_query = request.into_inner();
         let proto_query = feed_query
@@ -649,7 +659,7 @@ impl pb::following_feed_service_server::FollowingFeedService for FollowingFeedSe
             .ok_or_else(|| Status::invalid_argument("query must be specified"))?;
         let cursor_str = proto_query.cursor.clone();
         let request_context = proto_query.request_context.clone();
-        let is_polling = polling_header || proto_query.is_polling;
+        let is_polling = strato_ctx.is_polling || proto_query.is_polling;
         let ctx = self
             .query_builder
             .build(
@@ -669,6 +679,8 @@ impl pb::following_feed_service_server::FollowingFeedService for FollowingFeedSe
         query.in_network_only = true;
         query.request_context = request_context;
         query.is_polling = is_polling;
+        query.mobile_device_id = strato_ctx.mobile_device_id;
+        query.mobile_device_ad_id = strato_ctx.ad_id;
         if !cursor_str.is_empty() {
             match cursor_utils::decode_ordered_cursor(&cursor_str) {
                 Ok(Some(c)) => {
@@ -720,6 +732,7 @@ impl pb::following_feed_service_server::FollowingFeedService for FollowingFeedSe
             mut query,
             root_span,
         } = ctx;
+        query.return_backbone_scores = true;
         query.in_network_only = true;
         let output = self.get_following_feed(query).instrument(root_span).await?;
 

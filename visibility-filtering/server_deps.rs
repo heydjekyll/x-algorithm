@@ -2,14 +2,14 @@ use crate::clients::socialgraph_client::ProdSocialgraphClient;
 use crate::filter::{FilterRequest, FilterResponse, FilterTweets};
 use crate::filter_tweets::FilterTweetsEndpoint;
 use crate::get_safety_labels::GetSafetyLabelsEndpoint;
-use crate::hydration::{FallbackCacheMode, HydrationPipeline};
+use crate::hydration::HydrationPipeline;
 use crate::models::{RawCandidate, TweetId};
 use crate::reference_compare::ReferenceCompareHarness;
 use crate::rules::{SafetyLevel, Verdict};
 use crate::safety_label_source::lookup::RemoteSource;
 use crate::safety_label_source::manhattan::ManhattanSource;
 use crate::safety_label_source::twemcache::TwemcacheSource;
-use crate::safety_label_source::warmer::{SampledWarmer, StratoWarmFetcher, Warmer};
+use crate::safety_label_source::warmer::{CacheWarmer, StratoWarmFetcher, Warmer};
 use crate::safety_label_source::{ManhattanLabelFetcher, MhLabelClient, SafetyLabelSource};
 use crate::server::VFServer;
 use std::future::Future;
@@ -85,20 +85,29 @@ where
     }
 }
 
-pub async fn build_prod_server(datacenter: &str) -> VFServer {
+#[expect(
+    clippy::expect_used,
+    reason = "startup fail-fast: init failure is fatal"
+)]
+pub async fn build_prod_server(
+    datacenter: &str,
+    feature_switches: Arc<xai_feature_switches::FeatureSwitches>,
+) -> VFServer {
     info!("Initializing prod clients for datacenter={}", datacenter);
 
     let init_deadline = tokio::time::Instant::now() + CLIENT_INIT_RETRY_BUDGET;
 
     let deterministic_aperture = std::env::var("APP_ENV").as_deref() == Ok("prod");
-    let fallback_cache_serve_stale = crate::config::fallback_cache_serve_stale_enabled();
-    let fallback_cache_mode = if fallback_cache_serve_stale {
-        FallbackCacheMode::ServeStale
-    } else if crate::config::fallback_cache_populate_enabled() {
-        FallbackCacheMode::Shadow
-    } else {
-        FallbackCacheMode::Disabled
-    };
+    let fallback_cache_enabled = crate::config::fallback_cache_enabled();
+    let fallback_cache = fallback_cache_enabled
+        .then(crate::hydration::gizmoduck_hydrator::GizmoduckAuthorHydrator::fallback_cache);
+    let author_id_fallback_enabled = crate::config::author_id_fallback_enabled();
+    let author_id_fallback_capacity = crate::config::author_id_fallback_capacity();
+    let author_id_fallback_cache = author_id_fallback_enabled.then(|| {
+        crate::hydration::tes_hydrator::TesHydrator::author_id_fallback_cache(
+            author_id_fallback_capacity,
+        )
+    });
 
     let tes_client: Arc<
         dyn xai_core_entities::tweet_entity_service_client::TESClient + Send + Sync,
@@ -205,17 +214,24 @@ pub async fn build_prod_server(datacenter: &str) -> VFServer {
         gizmoduck_client,
         sg_client,
         safety_label_source.clone(),
-        fallback_cache_mode,
+        fallback_cache,
+        author_id_fallback_cache,
     );
-    let policies = crate::rules::Policies::new();
-    let (home_rule_count, recommendations_rule_count) = policies.rule_counts();
-    let filter_tweets = FilterTweets::new(hydration_pipeline, policies);
+    let gating_countries = Arc::new(crate::params::NsfwGatingCountries::starting_at_default());
+    let fs_path = crate::config::fs_path();
+    gating_countries.refresh_and_check_drift(&feature_switches, &fs_path);
+    gating_countries.spawn_refresh(feature_switches, fs_path);
+    let rule_engine = crate::rules::RuleEngine::with_nsfw_gating_countries(gating_countries);
+    let (home_rule_count, recommendations_rule_count) = rule_engine.rule_counts();
+    let filter_tweets = FilterTweets::new(hydration_pipeline, rule_engine);
 
     warm_filter_tweets(&filter_tweets).await;
 
     info!(
         hydrator_count = 5,
-        ?fallback_cache_mode,
+        fallback_cache_enabled,
+        author_id_fallback_enabled,
+        author_id_fallback_capacity,
         home_rule_count,
         recommendations_rule_count,
         "VFServer initialized with prod clients"
@@ -231,6 +247,7 @@ async fn build_reference_compare_harness(
     datacenter: &str,
     init_deadline: tokio::time::Instant,
 ) -> Option<Arc<ReferenceCompareHarness>> {
+    #[expect(clippy::panic, reason = "startup fail-fast on misconfiguration")]
     let should_build = crate::reference_compare::should_build_harness(
         crate::config::dual_call_harness_enabled(),
         std::env::var("APP_ENV").ok().as_deref(),
@@ -244,6 +261,10 @@ async fn build_reference_compare_harness(
         "visibility-filtering-service.{}",
         std::env::var("APP_ENV").unwrap_or_else(|_| "staging".to_string())
     );
+    #[expect(
+        clippy::expect_used,
+        reason = "startup fail-fast: init failure is fatal"
+    )]
     let strato: Arc<dyn VfClient + Send + Sync> = Arc::new(
         init_client_with_retry("strato_vf", init_deadline, || {
             let client_id = client_id.clone();
@@ -267,12 +288,15 @@ async fn build_reference_compare_harness(
 
 const CACHE_WARM_REQUEST_TIMEOUT_MS: u64 = 500;
 
+#[expect(
+    clippy::expect_used,
+    reason = "startup fail-fast: init failure is fatal"
+)]
 async fn build_cache_warmer(
     datacenter: &str,
     init_deadline: tokio::time::Instant,
 ) -> Option<Arc<dyn Warmer>> {
-    let sample_pct = crate::config::cache_warm_sample_pct();
-    if sample_pct == 0 {
+    if !crate::config::cache_warm_enabled() {
         return None;
     }
 
@@ -301,14 +325,11 @@ async fn build_cache_warmer(
     })
     .await
     .expect("Failed to initialize Strato cache-warm client");
-    info!(sample_pct, "L2 cache warmer enabled");
-    Some(SampledWarmer::spawn(
-        Arc::new(StratoWarmFetcher::new(grpc)),
-        sample_pct,
-    ))
+    info!("L2 cache warmer enabled");
+    Some(CacheWarmer::spawn(Arc::new(StratoWarmFetcher::new(grpc))))
 }
 
-const TES_STRATO_REQUEST_TIMEOUT_MS: u64 = 100;
+const TES_STRATO_REQUEST_TIMEOUT_MS: u64 = crate::hydration::HYDRATION_TIMEOUT.as_millis() as u64;
 
 fn tes_client_config(deterministic_aperture: bool) -> TESClientConfig {
     TESClientConfig {
@@ -322,7 +343,8 @@ fn tes_client_config(deterministic_aperture: bool) -> TESClientConfig {
     }
 }
 
-const GIZMODUCK_STRATO_REQUEST_TIMEOUT_MS: u64 = 80;
+const GIZMODUCK_STRATO_REQUEST_TIMEOUT_MS: u64 =
+    crate::hydration::HYDRATION_TIMEOUT.as_millis() as u64;
 
 fn gizmoduck_client_config(deterministic_aperture: bool) -> GizmoduckClientConfig {
     GizmoduckClientConfig {
@@ -438,7 +460,7 @@ async fn warm_manhattan(manhattan: &dyn ManhattanLabelFetcher) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::filter::{FilterOutcome, FilterSummary};
+    use crate::filter::FilterOutcome;
     use crate::models::VfAction;
     use std::cell::Cell;
     use xai_visibility_filtering::models::FilteredReason;
@@ -548,22 +570,7 @@ mod tests {
                 safety_labels: None,
             })
             .collect();
-        FilterResponse {
-            summary: FilterSummary {
-                tweet_count: outcomes.len(),
-                drop_count: outcomes
-                    .iter()
-                    .filter(|outcome| matches!(outcome.verdict.action, VfAction::Drop(_)))
-                    .count(),
-                unresolved_author_count: outcomes
-                    .iter()
-                    .filter(|outcome| {
-                        outcome.verdict.decided_by == Verdict::unresolved_author().decided_by
-                    })
-                    .count(),
-            },
-            outcomes,
-        }
+        FilterResponse { outcomes }
     }
 
     #[test]

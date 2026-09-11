@@ -1,4 +1,4 @@
-// mirrored from config feature-switch defaults; last sync 2026-08-27T19:41:17Z
+// mirrored from config feature-switch defaults; last sync 2026-09-10T16:21:03Z
 use xai_feature_switches::param;
 
 param!(
@@ -95,6 +95,12 @@ param!(
     false
 );
 param!(
+    EnablePhoenixScoreStatsExperimentBucket,
+    bool,
+    "rust_home_mixer_enable_phoenix_score_stats_experiment_bucket",
+    false
+);
+param!(
     PhoenixRetrievalTopicInferenceClusterId,
     String,
     "rust_home_mixer_phoenix_retrieval_topic_inference_cluster_id",
@@ -128,7 +134,7 @@ param!(
     PhoenixRetrievalAggregationType,
     String,
     "rust_home_mixer_phoenix_retrieval_aggregation_type",
-    "DENSE_WITH_SHORT_DWELL"
+    "DENSE_WITH_LONG_DWELL"
 );
 
 param!(
@@ -153,7 +159,7 @@ param!(
     PhoenixRetrievalMOEInferenceClusterId,
     String,
     "rust_home_mixer_phoenix_retrieval_moe_inference_cluster_id",
-    "Experiment1Fou"
+    "Experiment2Memy04"
 );
 param!(
     PhoenixMOEMaxResults,
@@ -243,6 +249,7 @@ param!(
     "rust_home_mixer_log_slate_context",
     false
 );
+param!(RerankerHeadTag, i64, "rust_home_mixer_reranker_head_tag", 0);
 param!(
     OonWeightFactor,
     f64,
@@ -479,6 +486,18 @@ param!(
     "weighted"
 );
 param!(
+    WeightPerturbationSigma,
+    f64,
+    "rust_home_mixer_weight_perturbation_sigma",
+    0.0
+);
+param!(
+    WeightPerturbationSalt,
+    String,
+    "rust_home_mixer_weight_perturbation_salt",
+    ""
+);
+param!(
     DwellRegretTemperature,
     f64,
     "rust_home_mixer_dwell_regret_temperature",
@@ -617,6 +636,12 @@ param!(
     String,
     "rust_home_mixer_vm_ranker_cluster_id",
     "Experiment3"
+);
+param!(
+    PhoenixExperimentOverrides,
+    String,
+    "rust_home_mixer_phoenix_experiment_overrides",
+    ""
 );
 param!(
     VMRankerDppTheta,
@@ -902,7 +927,7 @@ param!(
     AdsBlenderType,
     String,
     "rust_home_mixer_ads_blender",
-    "partition_organic_low_risk"
+    "multi_risk"
 );
 
 param!(

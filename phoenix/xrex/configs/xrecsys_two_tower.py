@@ -270,8 +270,8 @@ def _xrecsys_two_tower_combined_base() -> dict:
         "empty_history_user_dropout_rate": 0.1,
         "learning_rate": 2e-3,
         "emb_learning_rate": 0.1,
-        "qk_norm": False,
-        "attn_logit_cap": 80.0,
+        "qk_norm": True,
+        "attn_logit_cap": -1,
         "primer_norm": True,
         "feature_prep_enabled": True,
         "enable_candidate_tower_linear_proj": False,
@@ -333,13 +333,7 @@ _H100_OVERRIDES = {
     "attn_impl": "pallas_ranker_varlen_attn",
 }
 
-_GB300_OVERRIDES = {
-    "bs_per_device": 768,
-    "ep": 32,
-    "attn_impl": "cutedsl_ranker_varlen_attn",
-    "remat_policy": RematType.SAVE_GB300_RECSYS,
-    "unroll_layer_stack": True,
-}
+_GB300_OVERRIDES = {"bs_per_device": 960, "ep": 64, "attn_impl": "cutedsl_ranker_varlen_attn"}
 
 
 MODEL_CFGS = {

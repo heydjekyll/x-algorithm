@@ -1,4 +1,5 @@
 use crate::models::brand_safety::BrandSafetyVerdict;
+use crate::models::content_features;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 pub use xai_candidate_pipeline::component_library::models::PhoenixScores;
@@ -24,6 +25,10 @@ pub struct PostCandidate {
     pub slate_context: Option<SlateContext>,
     #[serde(default)]
     pub served_slate_context: Option<SlateContext>,
+    #[serde(default)]
+    pub reranker_head_tag: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backbone_scores: Option<PhoenixScores>,
     #[serde(
         serialize_with = "serialize_served_type",
         deserialize_with = "deserialize_served_type"
@@ -36,10 +41,20 @@ pub struct PostCandidate {
     pub ancestor_texts: HashMap<u64, String>,
     pub quoted_tweet_text: Option<String>,
     pub min_video_duration_ms: Option<i32>,
+    pub max_video_duration_ms: Option<i32>,
+    pub has_photo: Option<bool>,
+    pub has_video: Option<bool>,
+    pub media_count: Option<i32>,
     pub quoted_video_duration_ms: Option<i32>,
+    pub quoted_has_media: Option<bool>,
+    pub quoted_has_photo: Option<bool>,
+    pub quoted_has_video: Option<bool>,
+    pub quoted_media_count: Option<i32>,
+    pub quoted_max_video_duration_ms: Option<i32>,
     pub author_followers_count: Option<i32>,
     pub author_screen_name: Option<String>,
     pub retweeted_screen_name: Option<String>,
+    pub visibility_action: Option<vf::Action>,
     pub visibility_reason: Option<vf::FilteredReason>,
     pub drop_ancillary_posts: Option<bool>,
     pub subscription_author_id: Option<u64>,
@@ -100,6 +115,10 @@ pub struct SlateContext {
     pub recon_count_above: Option<u32>,
     #[serde(default)]
     pub recon_gap_above: Option<u32>,
+    #[serde(default)]
+    pub exact_k: Option<u32>,
+    #[serde(default)]
+    pub exact_gap: Option<u32>,
 }
 
 impl From<xai_recsys_proto::SlateContext> for SlateContext {
@@ -120,6 +139,8 @@ impl From<xai_recsys_proto::SlateContext> for SlateContext {
             recon_cos_milli: c.recon_cos_milli,
             recon_count_above: c.recon_count_above,
             recon_gap_above: c.recon_gap_above,
+            exact_k: c.exact_k,
+            exact_gap: c.exact_gap,
         }
     }
 }
@@ -160,7 +181,7 @@ pub trait CandidateHelpers {
     fn get_original_tweet_id(&self) -> u64;
     fn get_original_author_id(&self) -> u64;
     fn as_tweet_info(&self, is_followed_by_viewer: bool) -> xai_recsys_proto::TweetInfo;
-    fn as_score_info(&self) -> xai_recsys_proto::ScoreInfo;
+    fn as_score_info_no_prediction_scores(&self) -> xai_recsys_proto::ScoreInfo;
 }
 
 impl CandidateHelpers for PostCandidate {
@@ -185,9 +206,9 @@ impl CandidateHelpers for PostCandidate {
         self.retweeted_user_id.unwrap_or(self.author_id)
     }
 
-    fn as_score_info(&self) -> xai_recsys_proto::ScoreInfo {
+    fn as_score_info_no_prediction_scores(&self) -> xai_recsys_proto::ScoreInfo {
         xai_recsys_proto::ScoreInfo {
-            prediction_scores: self.phoenix_scores.as_prediction_scores(),
+            prediction_scores: Default::default(),
             weighted_score: self.weighted_score,
             final_score: self.score,
             slate_context: self.slate_context.map(|c| xai_recsys_proto::SlateContext {
@@ -206,8 +227,12 @@ impl CandidateHelpers for PostCandidate {
                 recon_cos_milli: c.recon_cos_milli,
                 recon_count_above: c.recon_count_above,
                 recon_gap_above: c.recon_gap_above,
+                exact_k: c.exact_k,
+                exact_gap: c.exact_gap,
             }),
             reward_rerank_slot_prob: None,
+            page_decode_slot_prob: None,
+            reranker_head_tag: self.reranker_head_tag,
         }
     }
 
@@ -268,6 +293,8 @@ impl CandidateHelpers for PostCandidate {
                 },
             }),
             semantic_ids: self.semantic_ids.clone().unwrap_or_default(),
+            content_features: Some(content_features::build(self)),
+            quoted_content_features: content_features::build_quoted(self),
             ..Default::default()
         }
     }
@@ -311,10 +338,30 @@ mod tests {
     #[test]
     fn post_candidate_deserializes_without_slate_context_field() {
         let mut value = serde_json::to_value(PostCandidate::default()).unwrap();
-        value.as_object_mut().unwrap().remove("slate_context");
+        let obj = value.as_object_mut().unwrap();
+        obj.remove("slate_context");
+        for field in [
+            "has_photo",
+            "has_video",
+            "media_count",
+            "max_video_duration_ms",
+            "quoted_has_media",
+            "quoted_has_photo",
+            "quoted_has_video",
+            "quoted_media_count",
+            "quoted_max_video_duration_ms",
+        ] {
+            obj.remove(field);
+        }
+        obj.insert(
+            "field_from_newer_build".to_string(),
+            serde_json::json!(true),
+        );
 
         let candidate: PostCandidate = serde_json::from_value(value).unwrap();
         assert_eq!(candidate.slate_context, None);
+        assert_eq!(candidate.has_video, None);
+        assert_eq!(candidate.media_count, None);
     }
 
     #[test]

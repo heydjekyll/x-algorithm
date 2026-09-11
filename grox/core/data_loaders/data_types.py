@@ -221,6 +221,7 @@ class Video(BaseModel):
     videoInfo: VideoInfo | None = None
     animatedGifInfo: VideoInfo | None = None
     convo_video: ConvoVideo | None = None
+    crop_seconds: float | None = None
 
     @classmethod
     def from_thrift_model(cls, media_entity: t.MediaEntity) -> "Video":
@@ -373,7 +374,7 @@ class LegacyCard(BaseModel):
     def to_convo(self) -> list[str | ConvoImage]:
         body: list[str | ConvoImage] = []
         if self.title:
-            body.append(f"\n\nTitle: {self.title}")
+            body.append(f"\n\n[Card Title] {self.title}")
         if self.description:
             body.append(f"\n\nDescription: {self.description}")
         if self.domain:
@@ -445,7 +446,7 @@ class UnifiedCard(BaseModel):
     def to_convo(self) -> list[str | ConvoImage | ConvoVideo]:
         res: list[str | ConvoImage | ConvoVideo] = ["\n\n[Card] ", " "]
         if self.title:
-            res.append(f"\n\nTitle: {self.title}")
+            res.append(f"\n\n[Card Title] {self.title}")
         if self.description:
             res.append(f"\n\nDescription: {self.description}")
         if self.url:
@@ -528,6 +529,7 @@ class BroadcastMetadata(BaseModel):
     media_key: str | None = None
     thumbnail_image: Image | None = None
     video: Video | None = None
+    crop_seconds: float | None = None
 
     @classmethod
     def from_thrift_model(
@@ -541,8 +543,8 @@ class BroadcastMetadata(BaseModel):
             else None,
         )
 
-    def to_convo(self) -> list[str | ConvoImage]:
-        res: list[str | ConvoImage] = [
+    def to_convo(self) -> list[str | ConvoImage | ConvoVideo]:
+        res: list[str | ConvoImage | ConvoVideo] = [
             "\n\nThis post has the following broadcast metadata attached:"
         ]
         if self.thumbnail_image and self.thumbnail_image.convo_image:

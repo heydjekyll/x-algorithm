@@ -97,7 +97,10 @@ class TaskSafetyPtosPolicyDetection(TaskWithPost):
                 violation.safetyPolicy = await cls.cross_validator.validate(
                     violation.category, post, policy
                 )
-            elif violation.category == SafetyPolicyCategory.ViolentMedia:
+            elif violation.category in (
+                SafetyPolicyCategory.ViolentMedia,
+                SafetyPolicyCategory.IllegalAndRegulatedBehaviors,
+            ):
                 policy = await active_classifier.classify_policy_for_violation(
                     post, violation
                 )
@@ -149,9 +152,12 @@ class TaskSafetyPtosPolicyDetection(TaskWithPost):
         if policy is None:
             return None
         recheck.safetyPolicy = policy
-        cls._record_policy_metrics(metric_prefix, recheck)
+        Metrics.counter(f"{metric_prefix}.high_fav_adult_recheck.count").add(
+            1, attributes={"policy_type": policy.policyType.name}
+        )
         if policy.policyType == SafetyPolicyType.NoViolation:
             return None
+        cls._record_policy_metrics(metric_prefix, recheck)
         return recheck
 
     @classmethod

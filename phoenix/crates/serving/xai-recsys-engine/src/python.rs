@@ -895,8 +895,6 @@ struct RecsysPredictorImpl {
     reload_directive: Arc<StdMutex<Option<ReloadDirective>>>,
     enqueue_timeout_ms: u64,
     mm_embeddings_client: Option<MmEmbeddingsClient>,
-    #[allow(dead_code)]
-    sid_client: Option<Arc<crate::sid_client::SemanticIdClient>>,
     admission: Arc<AdmissionController>,
     #[allow(dead_code)]
     prefetch_mm_query_config: Option<Arc<PrefetchMmQueryConfig>>,
@@ -1877,7 +1875,7 @@ impl PrepareBatch<PredictRequestBatch> for RankingBatchPrep {
         let output_vocab_size = model_config.hash_table.output_vocab_size;
         let num_continuous_actions = model_config.hash_table.num_continuous_actions;
         let embedding_dim = model_config.multimodal_embedding_dim;
-        let search_query_embedding_dim = model_config.hash_table.search_query_embedding_dim;
+        let search_query_embedding_dim = model_config.search_query_embedding_dim;
         let sid_num_levels = model_config.sid_num_levels;
 
         py.detach(|| {
@@ -2024,6 +2022,7 @@ impl PrepareBatch<PredictRequestBatch> for RankingBatchPrep {
                     .par_chunks(chunk_size)
                     .zip(candidate_embeddings_slices.par_iter_mut())
                     .for_each(|(items_chunk, shard_slice)| {
+                        shard_slice.fill(f16::ZERO);
                         shard_slice
                             .par_chunks_exact_mut(row_size)
                             .zip(items_chunk.par_iter())
@@ -2031,7 +2030,10 @@ impl PrepareBatch<PredictRequestBatch> for RankingBatchPrep {
                                 if let Some(ref input_buffer) = item.input_buffer {
                                     let src = &input_buffer.candidate_embeddings;
                                     let copy_len = embedding_row.len().min(src.len());
-                                    embedding_row[..copy_len].copy_from_slice(&src[..copy_len]);
+                                    if copy_len > 0 {
+                                        embedding_row[..copy_len]
+                                            .copy_from_slice(&src[..copy_len]);
+                                    }
                                 }
                             });
                     });
@@ -2040,14 +2042,23 @@ impl PrepareBatch<PredictRequestBatch> for RankingBatchPrep {
             if search_query_embedding_dim > 0
                 && let Some(sq_slice) = candidate_search_query_embeddings_slice
             {
+                sq_slice.fill(0.0);
                 sq_slice
                     .par_chunks_exact_mut(candidate_seq_len * search_query_embedding_dim)
                     .take(length_of_input)
                     .zip(request.items.par_iter())
                     .for_each(|(search_query_emb_row, item)| {
                         if let Some(ref input_buffer) = item.input_buffer {
-                            search_query_emb_row
-                                .copy_from_slice(&input_buffer.candidate_search_query_embeddings);
+                            let src = &input_buffer.candidate_search_query_embeddings;
+                            if src.len() == search_query_embedding_dim {
+                                let n_rep = input_buffer
+                                    .num_real_candidates(num_item_hashes, candidate_seq_len);
+                                xai_recsys::util::repeat_query_into(
+                                    search_query_emb_row,
+                                    src,
+                                    n_rep,
+                                );
+                            }
                         }
                     });
             }
@@ -2721,8 +2732,6 @@ struct RecsysRetrievalPredictorImpl {
     reload_directive: Arc<StdMutex<Option<ReloadDirective>>>,
     enqueue_timeout_ms: u64,
     mm_embeddings_client: Option<MmEmbeddingsClient>,
-    #[allow(dead_code)]
-    sid_client: Option<Arc<crate::sid_client::SemanticIdClient>>,
     admission: Arc<AdmissionController>,
     prefetch_mm_query_config: Option<Arc<PrefetchMmQueryConfig>>,
 }
@@ -3084,7 +3093,6 @@ macro_rules! server_impl {
                         enqueue_timeout_ms = ENQUEUE_TIMEOUT_MS,
                         queue_max_staleness_ms = QUEUE_MAX_STALENESS_MS,
                         mm_client = None,
-                        sid_client = None,
                         user_id_table_size = 100_000,
                         user_hash_scales = vec![196742702, 1852108266],
                         user_biases = vec![1935840681, 167407236],
@@ -3149,7 +3157,6 @@ macro_rules! server_impl {
                         enqueue_timeout_ms: u64,
                         queue_max_staleness_ms: u64,
                         mm_client: Option<&PyMmEmbeddingsClient>,
-                        sid_client: Option<&crate::sid_client::PySemanticIdClient>,
                         user_id_table_size: usize,
                         user_hash_scales: Vec<i64>,
                         user_biases: Vec<i64>,
@@ -3298,7 +3305,6 @@ macro_rules! server_impl {
                         let _guard = runtime.enter();
 
                         let mm_embeddings_client = mm_client.map(|c| c.client().clone());
-                        let sid_client_arc = sid_client.map(|c| c.build());
 
                         let prefetch_mm_query_config: Option<Arc<PrefetchMmQueryConfig>> =
                             if prefetch_mm_query_for_retrieval && mm_embeddings_client.is_some() {
@@ -3337,7 +3343,6 @@ macro_rules! server_impl {
                             reload_directive: reload_directive.clone(),
                             enqueue_timeout_ms,
                             mm_embeddings_client,
-                            sid_client: sid_client_arc,
                             admission: admission.clone(),
                             prefetch_mm_query_config,
                         };
@@ -3676,7 +3681,6 @@ pub fn xai_recsys_engine(_py: Python<'_>, m: &Bound<PyModule>) -> PyResult<()> {
     m.add_class::<RankingBatchPrep>()?;
     m.add_class::<RetrievalBatchPrep>()?;
     m.add_class::<PyMmEmbeddingsClient>()?;
-    m.add_class::<crate::sid_client::PySemanticIdClient>()?;
     m.add_class::<RecsysPredictorServer>()?;
     m.add_class::<RecsysRetrievalPredictorServer>()?;
     m.add_class::<PredictRequestBatch>()?;

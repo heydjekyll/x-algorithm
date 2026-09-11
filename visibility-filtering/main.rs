@@ -1,3 +1,15 @@
+#![deny(
+    clippy::dbg_macro,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::panic,
+    clippy::print_stderr,
+    clippy::print_stdout,
+    clippy::todo,
+    clippy::unimplemented,
+    clippy::unwrap_used
+)]
+
 use clap::Parser;
 use xai_dark_traffic::RejectDarkTrafficLayer;
 use xai_grpc_compression::GrpcZstdLayer;
@@ -25,6 +37,7 @@ async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
 
     XServiceBuilder::new("visibility-filtering-service")
+        .with_featureswitches(xai_visibility_filtering_service::config::fs_path())
         .grpc_port(args.grpc_port)
         .metrics_port(args.metrics_port)
         .datacenter(args.datacenter)

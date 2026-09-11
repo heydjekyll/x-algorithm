@@ -200,6 +200,7 @@ fn group_diffs(diffs: &[Diff]) -> Vec<Group<'_>> {
                 });
                 groups.len() - 1
             });
+        #[expect(clippy::indexing_slicing, reason = "at indexes a group already pushed")]
         groups[at].tweet_ids.push(diff.tweet_id);
     }
     groups
@@ -253,19 +254,21 @@ pub(crate) fn chunk_lines(
         .to_string()
         .len();
     let budget = LINE_BUDGET_BYTES.saturating_sub(header_len);
-    let mut pages: Vec<Vec<serde_json::Value>> = vec![Vec::new()];
+    let mut pages: Vec<Vec<serde_json::Value>> = Vec::new();
+    let mut current: Vec<serde_json::Value> = Vec::new();
     let mut used = 0;
     for group in group_diffs(diffs) {
         for slice in group_slices(&group, budget) {
             let cost = slice.to_string().len() + 1;
-            if used + cost > budget && pages.last().is_some_and(|page| !page.is_empty()) {
-                pages.push(Vec::new());
+            if used + cost > budget && !current.is_empty() {
+                pages.push(std::mem::take(&mut current));
                 used = 0;
             }
             used += cost;
-            pages.last_mut().expect("pages is never empty").push(slice);
+            current.push(slice);
         }
     }
+    pages.push(current);
     let total = pages.len();
     pages
         .into_iter()
@@ -338,7 +341,7 @@ impl ReferenceCompareHarness {
         harness
     }
 
-            pub(crate) fn begin_compare(
+    pub(crate) fn begin_compare(
         self: &Arc<Self>,
         viewer_id: Option<u64>,
         country_code: Option<String>,
@@ -370,13 +373,17 @@ impl ReferenceCompareHarness {
             let (reference_outcome, verdicts) =
                 futures::future::join(tokio::time::timeout(REFERENCE_TIMEOUT, reference_fut), rx)
                     .await;
-            let reference_results = match reference_outcome {
-                Ok(results) => results,
-                Err(_) => {
-                    harness.incr(ERROR, &[("kind", "timeout")]);
-                    return;
-                }
-            };
+            let reference_results: HashMap<u64, anyhow::Result<Option<FilteredReason>>> =
+                match reference_outcome {
+                    Ok(results) => results
+                        .into_iter()
+                        .map(|(id, r)| (id, r.map(|t| t.reason)))
+                        .collect(),
+                    Err(_) => {
+                        harness.incr(ERROR, &[("kind", "timeout")]);
+                        return;
+                    }
+                };
             let Ok(verdicts) = verdicts else { return };
             let context = CompareContext {
                 viewer_id,
@@ -388,7 +395,10 @@ impl ReferenceCompareHarness {
             harness.emit(safety_level, &counts);
             if !diffs.is_empty() {
                 for line in chunk_lines(&context, &batch_id(), &diffs) {
-                    println!("{line}");
+                    #[expect(clippy::print_stdout, reason = "stdout is the diff sink")]
+                    {
+                        println!("{line}");
+                    }
                 }
             }
         });
@@ -427,6 +437,8 @@ mod tests {
     use xai_visibility_filtering::models::{
         Action, DropReason, KeywordMatch, SafetyResult as ReferenceSafetyResult,
     };
+    use xai_visibility_filtering::tweet_safety_label::SafetyLabelFailure;
+    use xai_visibility_filtering::vf_client::TweetVisibility;
 
     fn reference_allow() -> Option<FilteredReason> {
         None
@@ -625,7 +637,7 @@ mod tests {
         }
     }
 
-        const ID: u64 = 1_000_000_000_000_000_000;
+    const ID: u64 = 1_000_000_000_000_000_000;
 
     #[test]
     fn identical_pairs_group_into_one_diffs_entry() {
@@ -728,8 +740,20 @@ mod tests {
             safety_level: ReferenceSafetyLevel,
             for_user_id: u64,
             context: Option<TwitterContextViewer>,
-        ) -> HashMap<u64, anyhow::Result<Option<FilteredReason>>> {
-            let results = tweet_ids.iter().map(|&id| (id, Ok(None))).collect();
+        ) -> HashMap<u64, anyhow::Result<TweetVisibility>> {
+            let results = tweet_ids
+                .iter()
+                .map(|&id| {
+                    (
+                        id,
+                        Ok(TweetVisibility {
+                            action: Action::Allow,
+                            reason: None,
+                            safety_labels: Err(SafetyLabelFailure::LookupFailed),
+                        }),
+                    )
+                })
+                .collect();
             self.calls.lock().unwrap().push((
                 tweet_ids,
                 safety_level,
