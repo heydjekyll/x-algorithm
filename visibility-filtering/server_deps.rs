@@ -12,20 +12,30 @@ use crate::safety_label_source::twemcache::TwemcacheSource;
 use crate::safety_label_source::warmer::{CacheWarmer, StratoWarmFetcher, Warmer};
 use crate::safety_label_source::{ManhattanLabelFetcher, MhLabelClient, SafetyLabelSource};
 use crate::server::VFServer;
+use anyhow::Context;
 use std::future::Future;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tracing::{error, info, warn};
-use xai_core_entities::gizmoduck_client::{GizmoduckClientConfig, ProdGizmoduckClient};
+use xai_cache::discovery::WilyDiscovery;
+use xai_cache::{
+    CacheClient, ClientBuilder, ClientConfig, HashAlgorithm, Key, Protocol, TlsConfig,
+};
+use xai_core_entities::gizmoduck_client::ProdGizmoduckClient;
 use xai_core_entities::rpc_constants::{GizmoduckRpcConstants, RpcConstants, TESRpcConstants};
-use xai_core_entities::s2s::{S2S_CHAIN_PATH, S2S_CRT_PATH, S2S_KEY_PATH};
-use xai_core_entities::tweet_entity_service_client::{ProdTESClient, TESClientConfig};
+use xai_core_entities::s2s::{S2S_CHAIN_PATH, S2S_CLIENT_ID, S2S_CRT_PATH, S2S_KEY_PATH};
+use xai_core_entities::tweet_entity_service_client::ProdTESClient;
+use xai_strato::StratoGrpc;
 use xai_visibility_filtering::vf_client::{StratoVfClient, VfClient};
 use xai_x_rpc::balanced_channel::LbPolicy;
+use xai_x_rpc::grpc_client::{ChannelBuilder, TlsMode};
+use xai_x_rpc::retry::RetryConfig;
+use xai_x_rpc::timed_buffer::DEFAULT_BUFFER_MAX_WAIT;
+use xai_x_rpc::total_timeout::DEFAULT_TOTAL_TIMEOUT;
+use xai_xds_client::StartFrom;
 
 const CACHE_PATH: &str = "/s/cache/safety_label_store:twemcaches";
-const TES_READINESS_PROBE_PORT: u16 = 8081;
-const GIZMODUCK_READINESS_PROBE_PORT: u16 = 8081;
+const READINESS_PROBE_PORT: u16 = 8081;
 
 const CLIENT_INIT_RETRY_BUDGET: Duration = Duration::from_secs(240);
 const CLIENT_INIT_MAX_BACKOFF: Duration = Duration::from_secs(15);
@@ -112,13 +122,26 @@ pub async fn build_prod_server(
     let tes_client: Arc<
         dyn xai_core_entities::tweet_entity_service_client::TESClient + Send + Sync,
     > = Arc::new(
-        init_client_with_retry("tes", init_deadline, || {
-            ProdTESClient::new_with_config(
-                None,
-                datacenter,
-                None,
-                tes_client_config(deterministic_aperture),
+        init_client_with_retry("tes", init_deadline, || async move {
+            let strato = build_xds_strato(
+                XdsStratoParams {
+                    name: "tes-xds",
+                    xds_listener: "tweet-entity-service.prod.tweet-entity-service:fed-grpc",
+                    tls_domain: format!(
+                        "tweet-entity-service.tweet-entity-service.prod.{datacenter}.s2s.twttr.net"
+                    ),
+                    lb_policy: LbPolicy::penalized_peak_ewma(),
+                    client_id: S2S_CLIENT_ID.clone(),
+                    retry_config: Some(RetryConfig::for_idempotent()),
+                    max_batch_size: TESRpcConstants::max_batch_size(),
+                    enable_serve_within: true,
+                },
+                deterministic_aperture,
             )
+            .await?;
+            anyhow::Ok(ProdTESClient {
+                grpc_client: Arc::new(strato),
+            })
         })
         .await
         .expect("Failed to initialize TES client"),
@@ -129,20 +152,33 @@ pub async fn build_prod_server(
         dyn xai_core_entities::gizmoduck_client::GizmoduckClient + Send + Sync,
     > = Arc::new(
         init_client_with_retry("gizmoduck", init_deadline, || {
-            ProdGizmoduckClient::new_with_config(
-                None,
-                datacenter,
-                Some(gizmoduck_client_id.clone()),
-                gizmoduck_client_config(deterministic_aperture),
-            )
+            let client_id = gizmoduck_client_id.clone();
+            async move {
+                let strato = build_xds_strato(
+                    XdsStratoParams {
+                        name: "gizmoduck-xds",
+                        xds_listener: "gizmoduck.prod.gizmoduck:fed-grpc",
+                        tls_domain: format!("gizmoduck.gizmoduck.prod.{datacenter}.s2s.twttr.net"),
+                        lb_policy: LbPolicy::least_request(),
+                        client_id,
+                        retry_config: None,
+                        max_batch_size: GizmoduckRpcConstants::max_batch_size(),
+                        enable_serve_within: false,
+                    },
+                    deterministic_aperture,
+                )
+                .await?;
+                anyhow::Ok(ProdGizmoduckClient {
+                    grpc_client: Arc::new(strato),
+                })
+            }
         })
         .await
         .expect("Failed to initialize Gizmoduck client"),
     );
     info!(
         deterministic_aperture,
-        "TES client: aperture + penalized peak-EWMA P2C + readiness probe; Gizmoduck client: \
-         aperture + least-request P2C + readiness probe"
+        "TES and Gizmoduck clients ready over xDS"
     );
 
     let sg_client: Arc<dyn crate::clients::socialgraph_client::SocialgraphClient + Send + Sync> =
@@ -175,18 +211,27 @@ pub async fn build_prod_server(
     let twemcache_client_name = crate::config::twemcache_client_name();
     let twemcache = Arc::new(
         init_client_with_retry("twemcache", init_deadline, || {
-            crate::twemcache::TwemcacheClient::new_with_tls_paths(
-                CACHE_PATH,
-                twemcache_client_name.clone(),
-                datacenter,
-                &S2S_CHAIN_PATH,
-                &S2S_CRT_PATH,
-                &S2S_KEY_PATH,
-                Duration::from_millis(20),
-                Duration::from_secs(5),
-                crate::twemcache::client::default_connections_per_host(),
-                crate::twemcache::client::default_depth_cap(),
-            )
+            let name = twemcache_client_name.clone();
+            let zone = datacenter.to_string();
+            async move {
+                let discovery = Arc::new(WilyDiscovery::new(CACHE_PATH, name, zone).await?);
+                let config = ClientConfig::builder()
+                    .request_timeout(Duration::from_millis(20))
+                    .connect_timeout(Duration::from_secs(5))
+                    .hash_algorithm(HashAlgorithm::FNV1)
+                    .connections_per_endpoint(2)
+                    .depth_cap(100)
+                    .failure_accrual_enabled(false)
+                    .build();
+                ClientBuilder::new(Protocol::Memcached, discovery, config)
+                    .with_tls(TlsConfig {
+                        ca_cert_path: S2S_CHAIN_PATH.clone(),
+                        client_cert_path: S2S_CRT_PATH.clone(),
+                        client_key_path: S2S_KEY_PATH.clone(),
+                    })
+                    .build()
+                    .await
+            }
         })
         .await
         .expect("Failed to create twemcache client"),
@@ -198,7 +243,7 @@ pub async fn build_prod_server(
     warm_cache(&twemcache).await;
     warm_manhattan(mh_label_client.as_ref()).await;
 
-    let cache_warmer = build_cache_warmer(datacenter, init_deadline).await;
+    let cache_warmer = build_cache_warmer(datacenter, init_deadline, deterministic_aperture).await;
 
     let twemcache_source = Arc::new(TwemcacheSource::new(twemcache));
     let manhattan_source = Arc::new(ManhattanSource::new(mh_label_client));
@@ -295,6 +340,7 @@ const CACHE_WARM_REQUEST_TIMEOUT_MS: u64 = 500;
 async fn build_cache_warmer(
     datacenter: &str,
     init_deadline: tokio::time::Instant,
+    deterministic_aperture: bool,
 ) -> Option<Arc<dyn Warmer>> {
     if !crate::config::cache_warm_enabled() {
         return None;
@@ -309,7 +355,8 @@ async fn build_cache_warmer(
             ca_cert_path: S2S_CHAIN_PATH.clone(),
             client_cert_path: S2S_CRT_PATH.clone(),
             client_key_path: S2S_KEY_PATH.clone(),
-            num_endpoints: Some(12),
+            aperture_size: Some(STRATO_APERTURE_SIZE),
+            deterministic_aperture,
             connect_timeout_ms: 400,
             request_timeout_ms: CACHE_WARM_REQUEST_TIMEOUT_MS,
             client_id: Some(client_id.clone()),
@@ -317,11 +364,7 @@ async fn build_cache_warmer(
             zone: datacenter.to_string(),
             ..Default::default()
         };
-        async move {
-            xai_strato::StratoGrpc::new(config)
-                .await
-                .map_err(|e| e.to_string())
-        }
+        async move { StratoGrpc::new(config).await.map_err(|e| e.to_string()) }
     })
     .await
     .expect("Failed to initialize Strato cache-warm client");
@@ -329,37 +372,78 @@ async fn build_cache_warmer(
     Some(CacheWarmer::spawn(Arc::new(StratoWarmFetcher::new(grpc))))
 }
 
-const TES_STRATO_REQUEST_TIMEOUT_MS: u64 = crate::hydration::HYDRATION_TIMEOUT.as_millis() as u64;
+const STRATO_REQUEST_TIMEOUT: Duration = crate::hydration::HYDRATION_TIMEOUT;
+const STRATO_CONNECT_TIMEOUT: Duration = Duration::from_millis(400);
+const STRATO_APERTURE_SIZE: usize = 12;
+const XDS_EAGER_RESOLUTION_TIMEOUT: Duration = Duration::from_secs(5);
 
-fn tes_client_config(deterministic_aperture: bool) -> TESClientConfig {
-    TESClientConfig {
-        aperture_size: Some(TESRpcConstants::num_endpoints()),
-        deterministic_aperture,
-        lb_policy: Some(LbPolicy::penalized_peak_ewma()),
-        readiness_probe_port: Some(TES_READINESS_PROBE_PORT),
-        request_timeout_ms: Some(TES_STRATO_REQUEST_TIMEOUT_MS),
-        enable_serve_within: true,
-        ..Default::default()
-    }
+struct XdsStratoParams {
+    name: &'static str,
+    xds_listener: &'static str,
+    tls_domain: String,
+    lb_policy: LbPolicy,
+    client_id: String,
+    retry_config: Option<RetryConfig>,
+    max_batch_size: usize,
+    enable_serve_within: bool,
 }
 
-const GIZMODUCK_STRATO_REQUEST_TIMEOUT_MS: u64 =
-    crate::hydration::HYDRATION_TIMEOUT.as_millis() as u64;
-
-fn gizmoduck_client_config(deterministic_aperture: bool) -> GizmoduckClientConfig {
-    GizmoduckClientConfig {
-        aperture_size: Some(GizmoduckRpcConstants::num_endpoints()),
-        deterministic_aperture,
-        lb_policy: Some(LbPolicy::least_request()),
-        readiness_probe_port: Some(GIZMODUCK_READINESS_PROBE_PORT),
-        request_timeout_ms: Some(GIZMODUCK_STRATO_REQUEST_TIMEOUT_MS),
-        ..Default::default()
+async fn build_xds_strato(
+    params: XdsStratoParams,
+    deterministic_aperture: bool,
+) -> anyhow::Result<StratoGrpc> {
+    let mut builder = ChannelBuilder::new(params.name)
+        .tls(
+            TlsMode::mtls_from_env()
+                .context("S2S cert env vars required for mTLS")?
+                .with_domain_override(params.tls_domain),
+        )
+        .request_timeout(STRATO_REQUEST_TIMEOUT)
+        .connect_timeout(STRATO_CONNECT_TIMEOUT)
+        .xds(StartFrom::Lds(params.xds_listener.to_string()))
+        .await
+        .with_context(|| format!("failed to initialize xDS for {}", params.xds_listener))?
+        .eager_resolution(XDS_EAGER_RESOLUTION_TIMEOUT)
+        .aperture(STRATO_APERTURE_SIZE)
+        .readiness_probe(READINESS_PROBE_PORT, "/ready")
+        .buffer_max_wait(DEFAULT_BUFFER_MAX_WAIT)
+        .total_timeout(DEFAULT_TOTAL_TIMEOUT);
+    if deterministic_aperture {
+        builder = builder.deterministic();
     }
+
+    let channel = builder
+        .build_load_balanced(params.lb_policy)
+        .await
+        .with_context(|| {
+            format!(
+                "failed to build xDS LoadBalancedChannel for {}",
+                params.name
+            )
+        })?;
+
+    let mut strato = StratoGrpc::from_load_balanced_channel(
+        channel,
+        None,
+        Some(params.client_id),
+        params.retry_config,
+        params.max_batch_size,
+    );
+    if params.enable_serve_within {
+        strato = strato.with_op_context(xai_strato::strato_proto::OpContext {
+            serve_within: Some(xai_strato::strato_proto::ServeWithin {
+                duration_microseconds: STRATO_REQUEST_TIMEOUT.as_micros() as i64,
+                round_trip_allowance_microseconds: 10_000,
+            }),
+            ..Default::default()
+        });
+    }
+    Ok(strato)
 }
 
-async fn warm_cache(twemcache: &crate::twemcache::TwemcacheClient) {
+async fn warm_cache(twemcache: &CacheClient) {
     let start = Instant::now();
-    let key = match crate::twemcache::Key::new(b"slm_warmup".to_vec()) {
+    let key = match Key::new(b"slm_warmup".to_vec()) {
         Ok(key) => key,
         Err(e) => {
             warn!(error = %e, "Cache warmup key construction failed (non-fatal)");
@@ -367,20 +451,23 @@ async fn warm_cache(twemcache: &crate::twemcache::TwemcacheClient) {
         }
     };
     let latency_ms = || start.elapsed().as_millis() as u64;
-    match twemcache
-        .multi_get(std::slice::from_ref(&key))
-        .await
-        .get(&key)
-    {
-        Some(Ok(_)) => info!(latency_ms = latency_ms(), "Cache warmup succeeded"),
-        Some(Err(e)) => warn!(
+    match twemcache.multi_get(std::slice::from_ref(&key)).await {
+        Ok(map) => match map.get(&key) {
+            Some(Ok(_)) => info!(latency_ms = latency_ms(), "Cache warmup succeeded"),
+            Some(Err(e)) => warn!(
+                latency_ms = latency_ms(),
+                error = %e,
+                "Cache warmup failed (non-fatal)"
+            ),
+            None => warn!(
+                latency_ms = latency_ms(),
+                "Cache warmup returned no response (non-fatal)"
+            ),
+        },
+        Err(e) => warn!(
             latency_ms = latency_ms(),
             error = %e,
             "Cache warmup failed (non-fatal)"
-        ),
-        None => warn!(
-            latency_ms = latency_ms(),
-            "Cache warmup returned no response (non-fatal)"
         ),
     }
 }

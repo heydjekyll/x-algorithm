@@ -143,7 +143,9 @@ OPTIONAL_COLUMNS: list[str] = [
     "firstDpaProductKey",
     "authorFollowerCountSeq",
     "inReplyToPostIdSeq",
-    "is_delayed_feedback",
+    "sample_source",
+    "valueLabelValidSeq",
+    "valueBaselineMeanUsdSeq",
     "conversionKeepMask",
 ]
 

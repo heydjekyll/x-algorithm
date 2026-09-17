@@ -160,7 +160,7 @@ impl StratoVfClient {
             ca_cert_path,
             client_cert_path,
             client_key_path,
-            num_endpoints: Some(12),
+            aperture_size: Some(12),
             connect_timeout_ms: 400,
             request_timeout_ms: 990,
             client_id: Some(client_id),
@@ -962,6 +962,13 @@ mod rust_vf_tests {
 
     #[tonic::async_trait]
     impl VisibilityFilteringService for StubVfService {
+        async fn evaluate_tweets(
+            &self,
+            _: Request<vf_pb::EvaluateTweetsRequest>,
+        ) -> Result<Response<vf_pb::EvaluateTweetsResponse>, Status> {
+            Err(Status::unimplemented("unused"))
+        }
+
         async fn filter_tweets(
             &self,
             request: Request<vf_pb::VisibilityFilterRequest>,
@@ -1135,6 +1142,13 @@ mod rust_vf_tests {
 
         #[tonic::async_trait]
         impl VisibilityFilteringService for PartialVfService {
+            async fn evaluate_tweets(
+                &self,
+                _: Request<vf_pb::EvaluateTweetsRequest>,
+            ) -> Result<Response<vf_pb::EvaluateTweetsResponse>, Status> {
+                Err(Status::unimplemented("unused"))
+            }
+
             async fn filter_tweets(
                 &self,
                 request: Request<vf_pb::VisibilityFilterRequest>,
@@ -1213,6 +1227,13 @@ mod rust_vf_tests {
 
         #[tonic::async_trait]
         impl VisibilityFilteringService for FailSecondChunkService {
+            async fn evaluate_tweets(
+                &self,
+                _: Request<vf_pb::EvaluateTweetsRequest>,
+            ) -> Result<Response<vf_pb::EvaluateTweetsResponse>, Status> {
+                Err(Status::unimplemented("unused"))
+            }
+
             async fn filter_tweets(
                 &self,
                 request: Request<vf_pb::VisibilityFilterRequest>,

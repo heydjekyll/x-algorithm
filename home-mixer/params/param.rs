@@ -1,4 +1,4 @@
-// mirrored from config feature-switch defaults; last sync 2026-09-10T16:21:03Z
+// mirrored from config feature-switch defaults; last sync 2026-09-16T16:23:12Z
 use xai_feature_switches::param;
 
 param!(
@@ -98,6 +98,12 @@ param!(
     EnablePhoenixScoreStatsExperimentBucket,
     bool,
     "rust_home_mixer_enable_phoenix_score_stats_experiment_bucket",
+    false
+);
+param!(
+    EnableResponseDiversityStatsExperimentBucket,
+    bool,
+    "rust_home_mixer_enable_response_diversity_stats_experiment_bucket",
     false
 );
 param!(
@@ -417,34 +423,10 @@ param!(
     0.0
 );
 param!(
-    EnableClickDwellLowFavRatePenalty,
+    EnableCdwellOnImpr,
     bool,
-    "rust_home_mixer_enable_click_dwell_low_fav_rate_penalty",
+    "rust_home_mixer_enable_cdwell_on_impr",
     false
-);
-param!(
-    ClickDwellLowFavRatePenaltyBaseline,
-    f64,
-    "rust_home_mixer_click_dwell_low_fav_rate_penalty_baseline",
-    0.01
-);
-param!(
-    ClickDwellLowFavRatePenaltyAlpha,
-    f64,
-    "rust_home_mixer_click_dwell_low_fav_rate_penalty_alpha",
-    0.5
-);
-param!(
-    ClickDwellLowFavRatePenaltyFloor,
-    f64,
-    "rust_home_mixer_click_dwell_low_fav_rate_penalty_floor",
-    0.01
-);
-param!(
-    ClickDwellLowFavRatePenaltyCap,
-    f64,
-    "rust_home_mixer_click_dwell_low_fav_rate_penalty_cap",
-    1.0
 );
 param!(
     ContActiveSecs5mResidualNormWeight,
@@ -683,7 +665,7 @@ param!(
     ColdStartMaxPostAgeSecs,
     u64,
     "rust_home_mixer_cold_start_max_post_age_secs",
-    86400
+    172800
 );
 
 param!(
@@ -934,7 +916,7 @@ param!(
     EnableAdsBrandSafetyVerdictV2,
     bool,
     "rust_home_mixer_ads_bs_v2_exp_enabled",
-    true
+    false
 );
 param!(
     AdsTimeGapTSec,
@@ -1016,6 +998,13 @@ param!(
     u32,
     "rust_home_mixer_inventory_holdout_retweets_percent",
     0
+);
+
+param!(
+    EnableFavHoldout,
+    bool,
+    "rust_home_mixer_enable_fav_holdout",
+    false
 );
 
 param!(
