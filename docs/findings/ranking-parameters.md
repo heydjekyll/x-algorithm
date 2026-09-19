@@ -5,7 +5,10 @@
 > **Source:** `heydjekyll/x-algorithm`  
 > **Snapshot:** `home-mixer/params/param.rs`  
 > **Last audited:** 2026-08-28  
-> **Source sync noted in file:** 2026-08-27T19:41:17Z
+> **Source sync noted in file:** 2026-08-27T19:41:17Z  
+> **Last re-checked:** 2026-09-19 against upstream `xai-org/x-algorithm` commit `8b25829` (source sync noted in file: 2026-09-18T16:21:20Z)
+>
+> **Strikethrough convention:** `~~struck~~` marks an entry that was present in the source at audit time and is **no longer present** in the current source tree. Struck entries are deliberately kept visible instead of being removed, so the audit trail stays verifiable. Struck values are **historical**, not current. See [Changes since the audit](#changes-since-the-audit-2026-09-19).
 
 This page is an index of notable ranking and recommendation parameters found in the source tree. It is intended to make the audit reproducible and easy to reference.
 
@@ -107,7 +110,7 @@ The system can optimize the composition of the recommendation set.
 | `ColdStartSlotMin` | **15** |
 | `ColdStartSlotMax` | **16** |
 | `ColdStartFollowerCap` | **1000** |
-| `ColdStartMaxPostAgeSecs` | **86400** |
+| `ColdStartMaxPostAgeSecs` | ~~**86400**~~ **172800** |
 | `EnableViewerColdStart` | **true** |
 | `EnableColdStartThompsonSampling` | **false** |
 | `ColdStartBetaAlpha0` | **0.75** |
@@ -127,25 +130,35 @@ This is another reason to distinguish low-observation content from mature conten
 
 ## Dwell-regret model
 
+> **No longer present in the source.** The entire `DwellRegret*` parameter block was **removed** upstream between the audit and the 2026-09-18 sync:
+>
+> - `git grep -in "regret"` over the current upstream tree: **0 occurrences** (the identifier no longer exists anywhere in the repository).
+> - `home-mixer/scorers/value_model_gate.rs` (which consumed these parameters) was **deleted**.
+> - `home-mixer/params/param.rs` no longer defines any of the parameters below.
+>
+> The rows are kept **struck through** rather than deleted, so the audit remains reproducible and the mechanism's history stays visible. The struck values are the 2026-08-28 audit values, not current behavior — do not cite them as present-day parameters.
+
 Notable parameters include:
 
 | Parameter | Value |
 |---|---:|
-| `DwellRegretTemperature` | **10.0** |
-| `DwellRegretDwellFloor` | **1.0** |
-| `DwellRegretAlphaFavorite` | **1.0** |
-| `DwellRegretAlphaReply` | **1.0** |
-| `DwellRegretAlphaRetweet` | **1.0** |
-| `DwellRegretAlphaQuote` | **1.0** |
-| `DwellRegretAlphaShare` | **1.0** |
-| `DwellRegretAlphaShareViaDm` | **1.0** |
-| `DwellRegretAlphaShareViaCopyLink` | **1.0** |
-| `DwellRegretNegNotInterested` | **-10000.0** |
-| `DwellRegretNegBlockAuthor` | **-8000.0** |
-| `DwellRegretNegMuteAuthor` | **-15000.0** |
-| `DwellRegretNegReport` | **-60000.0** |
-| `DwellRegretGateBias` | **1.033918** |
-| `DwellRegretGateThreshold` | **-0.634264** |
+| ~~`DwellRegretTemperature`~~ | ~~**10.0**~~ |
+| ~~`DwellRegretDwellFloor`~~ | ~~**1.0**~~ |
+| ~~`DwellRegretAlphaFavorite`~~ | ~~**1.0**~~ |
+| ~~`DwellRegretAlphaReply`~~ | ~~**1.0**~~ |
+| ~~`DwellRegretAlphaRetweet`~~ | ~~**1.0**~~ |
+| ~~`DwellRegretAlphaQuote`~~ | ~~**1.0**~~ |
+| ~~`DwellRegretAlphaShare`~~ | ~~**1.0**~~ |
+| ~~`DwellRegretAlphaShareViaDm`~~ | ~~**1.0**~~ |
+| ~~`DwellRegretAlphaShareViaCopyLink`~~ | ~~**1.0**~~ |
+| ~~`DwellRegretNegNotInterested`~~ | ~~**-10000.0**~~ |
+| ~~`DwellRegretNegBlockAuthor`~~ | ~~**-8000.0**~~ |
+| ~~`DwellRegretNegMuteAuthor`~~ | ~~**-15000.0**~~ |
+| ~~`DwellRegretNegReport`~~ | ~~**-60000.0**~~ |
+| ~~`DwellRegretGateBias`~~ | ~~**1.033918**~~ |
+| ~~`DwellRegretGateThreshold`~~ | ~~**-0.634264**~~ |
+
+Two further members of the same block were present at audit time but were never indexed in this page and are equally gone: `DwellRegretGateWeights`, `DwellRegretGateHysteresisBand`.
 
 These should be treated as model internals rather than simple creator-facing “weights”.
 
@@ -167,6 +180,48 @@ The same parameter file exposes additional infrastructure signals, including:
 Not every parameter is a ranking weight. Some belong to retrieval, inference, hydration, experimentation, or infrastructure.
 
 This distinction matters when interpreting the source.
+
+Two values inside this configuration changed after the audit (parameter still present, value different): `PhoenixRetrievalAggregationType` **`DENSE_WITH_SHORT_DWELL` → `DENSE_WITH_LONG_DWELL`**, and `PhoenixRetrievalMOEInferenceClusterId` **`Experiment1Fou` → `Experiment3Memy04`**.
+
+## Changes since the audit (2026-09-19)
+
+Re-check performed on 2026-09-19 by diffing the audited snapshot against current upstream `main`.
+
+- Audited snapshot: `24c60942` — `home-mixer/params/param.rs` header `last sync 2026-08-27T19:41:17Z`, **189** parameters defined.
+- Current upstream: `8b25829` (2026-09-18T23:55:39Z) — header `last sync 2026-09-18T16:21:20Z`, **175** parameters defined.
+- Other parameters files touched in the same window: `visibility-filtering/params.rs`, `visibility-filtering/config.rs`, `phoenix/xrex/configs/*`, `home-mixer/models/content_features.rs`.
+
+### Removed after the audit
+
+- `DwellRegret*` — the whole block: the 15 parameters struck through above, plus `DwellRegretGateWeights` and `DwellRegretGateHysteresisBand`, which were present at audit time but were never indexed in this page. The consuming module `home-mixer/scorers/value_model_gate.rs` was deleted, and no `regret` identifier remains anywhere in the tree.
+- `ValueModelMode` (audited value `"weighted"`) — no longer defined in `param.rs`.
+- `EnableClickDwellLowFavRatePenalty` (audited `false`) and its four companions `ClickDwellLowFavRatePenaltyBaseline` (`0.01`), `ClickDwellLowFavRatePenaltyAlpha` (`0.5`), `ClickDwellLowFavRatePenaltyFloor` (`0.01`), `ClickDwellLowFavRatePenaltyCap` (`1.0`) — no longer defined in `param.rs`.
+
+### Changed values after the audit
+
+| Parameter | Audited (2026-08-28) | Current (`8b25829`) |
+|---|---|---|
+| `ColdStartMaxPostAgeSecs` | `86400` | `172800` |
+| `PhoenixRetrievalAggregationType` | `DENSE_WITH_SHORT_DWELL` | `DENSE_WITH_LONG_DWELL` |
+| `PhoenixRetrievalMOEInferenceClusterId` | `Experiment1Fou` | `Experiment3Memy04` |
+
+Every other indexed parameter — the core action weights, the negative-feedback weights, author diversity, out-of-network rescoring, the VM/DPP reranker and the rest of the cold-start block — is **unchanged** (42 of the 58 indexed entries are byte-identical).
+
+### Added after the audit (never audited, listed for completeness only)
+
+`EnableCdwellOnImpr` (`false`), `EnableFavHoldout` (`false`), `EnablePhoenixScoreStatsExperimentBucket` (`false`), `EnableResponseDiversityStatsExperimentBucket` (`false`), `PhoenixColdStartMaxResults` (`0`), `PhoenixExperimentOverrides` (`""`), `RerankerHeadTag` (`0`), `WeightPerturbationSalt` (`""`), `WeightPerturbationSigma` (`0.0`).
+
+These are new observations, not part of the 2026-08-28 audit scope, and carry no audited interpretation here.
+
+### Method
+
+```
+git clone https://github.com/xai-org/x-algorithm
+git show 24c60942:home-mixer/params/param.rs   # audited baseline
+git show 8b25829:home-mixer/params/param.rs    # current
+diff -u <baseline> <current>
+git grep -in "regret" 8b25829                  # removed identifiers
+```
 
 ## Evidence classification
 
@@ -203,8 +258,16 @@ The values in this page are a dated research snapshot, not a claim that these co
 
 **Repository:** `heydjekyll/x-algorithm`
 
+**Upstream repository:** `xai-org/x-algorithm`
+
 **Source file:** `home-mixer/params/param.rs`
 
 **Audit date:** 2026-08-28
 
 **Source sync noted in file:** 2026-08-27T19:41:17Z
+
+**Audited snapshot commit:** `24c60942`
+
+**Re-check date:** 2026-09-19
+
+**Upstream commit at re-check:** `8b25829` (source sync noted in file: 2026-09-18T16:21:20Z)
