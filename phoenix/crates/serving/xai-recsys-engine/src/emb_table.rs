@@ -436,6 +436,10 @@ const WIDTH: usize = 2usize.pow(7);
 const CONCURRENCY_OUTER: usize = 8;
 const CONCURRENCY_INNER: usize = 16;
 
+fn reassembly_slice_size(chunk_len: usize, row_size: usize) -> usize {
+    cmp::max(1, chunk_len / row_size / CONCURRENCY_INNER) * row_size
+}
+
 lazy_static! {
     static ref CONNECT_TIMEOUT: Duration = {
         std::env::var("COPY_PORT_CONNECT_TIMEOUT_SECS")
@@ -480,6 +484,16 @@ pub(crate) fn apply_copy_port_http2(endpoint: transport::Endpoint) -> transport:
 }
 
 pub(crate) async fn get_channels(target: String) -> Result<Vec<transport::Channel>, Status> {
+    Ok(get_channels_with_endpoints(target)
+        .await?
+        .into_iter()
+        .map(|(channel, _)| channel)
+        .collect())
+}
+
+pub(crate) async fn get_channels_with_endpoints(
+    target: String,
+) -> Result<Vec<(transport::Channel, transport::Endpoint)>, Status> {
     if target.is_empty() {
         return Ok(Vec::new());
     }
@@ -503,7 +517,10 @@ pub(crate) async fn get_channels(target: String) -> Result<Vec<transport::Channe
                 async move {
                     let endpoint =
                         apply_copy_port_http2(endpoint).connect_timeout(*CONNECT_TIMEOUT);
-                    (endpoint.connect().await, t)
+                    (
+                        endpoint.connect().await.map(|channel| (channel, endpoint)),
+                        t,
+                    )
                 }
             }),
     )
@@ -542,6 +559,14 @@ pub(crate) async fn get_channels(target: String) -> Result<Vec<transport::Channe
 pub(crate) fn peer_conns_per_source() -> usize {
     parse_conns_per_source(
         std::env::var("COPY_PORT_PEER_CONNS_PER_SOURCE")
+            .ok()
+            .as_deref(),
+    )
+}
+
+pub(crate) fn trainer_conns_per_source() -> usize {
+    parse_conns_per_source(
+        std::env::var("COPY_PORT_TRAINER_CONNS_PER_SOURCE")
             .ok()
             .as_deref(),
     )
@@ -615,19 +640,33 @@ pub(crate) async fn expand_replicated_channels(
     );
 }
 
-struct JoinOnDrop<T> {
+pub(crate) struct JoinOnDrop<T> {
     handle: Option<tokio::task::JoinHandle<T>>,
 }
 
 impl<T> JoinOnDrop<T> {
-    fn new(handle: tokio::task::JoinHandle<T>) -> Self {
+    pub(crate) fn new(handle: tokio::task::JoinHandle<T>) -> Self {
         Self {
             handle: Some(handle),
         }
     }
 
-    async fn join(mut self) -> Result<T, tokio::task::JoinError> {
-        self.handle.take().expect("join").await
+    pub(crate) async fn join(mut self) -> Result<T, tokio::task::JoinError> {
+        let result = self.handle.as_mut().expect("join").await;
+        self.handle.take();
+        result
+    }
+}
+
+struct JoinWake(std::thread::Thread);
+
+impl std::task::Wake for JoinWake {
+    fn wake(self: std::sync::Arc<Self>) {
+        self.0.unpark();
+    }
+
+    fn wake_by_ref(self: &std::sync::Arc<Self>) {
+        self.0.unpark();
     }
 }
 
@@ -636,7 +675,14 @@ impl<T> Drop for JoinOnDrop<T> {
         let Some(handle) = self.handle.take() else {
             return;
         };
-        let _ = tokio::task::block_in_place(|| tokio::runtime::Handle::current().block_on(handle));
+        let mut handle = tokio::task::unconstrained(handle);
+        let thread = std::thread::current();
+        let waker = std::task::Waker::from(std::sync::Arc::new(JoinWake(thread)));
+        let mut context = std::task::Context::from_waker(&waker);
+        while std::future::Future::poll(std::pin::Pin::new(&mut handle), &mut context).is_pending()
+        {
+            std::thread::park();
+        }
     }
 }
 
@@ -1450,7 +1496,7 @@ pub fn load_tensor_into(
                     }
 
                     let y0 = block_idx * delta_shards * w_s;
-                    let slice_size = chunk.len() / CONCURRENCY_INNER / row_size * row_size;
+                    let slice_size = reassembly_slice_size(chunk.len(), row_size);
                     let base_ptr = chunk.as_ptr() as usize;
                     chunk.par_chunks_mut(slice_size).for_each(|slice| {
                         let row_idx_base = (slice.as_ptr() as usize - base_ptr) / row_size;
@@ -1694,8 +1740,88 @@ mod channel_config_tests {
     fn conns_per_source_parses_and_clamps() {
         assert_eq!(parse_conns_per_source(None), 1);
         assert_eq!(parse_conns_per_source(Some("bogus")), 1);
+        assert_eq!(parse_conns_per_source(Some("")), 1);
+        assert_eq!(parse_conns_per_source(Some("-1")), 1);
+        assert_eq!(parse_conns_per_source(Some("18446744073709551616")), 1);
         assert_eq!(parse_conns_per_source(Some("4")), 4);
         assert_eq!(parse_conns_per_source(Some("0")), 1);
         assert_eq!(parse_conns_per_source(Some("64")), 16);
+    }
+}
+
+#[cfg(test)]
+mod load_tensor_into_tests {
+    use super::*;
+
+    #[test]
+    fn reassembly_slices_are_whole_rows_and_never_empty() {
+        let row_size = 2048;
+        for rows in [
+            1,
+            CONCURRENCY_INNER - 1,
+            CONCURRENCY_INNER,
+            1000,
+            READ_SIZE / row_size,
+        ] {
+            let slice_size = reassembly_slice_size(rows * row_size, row_size);
+            assert!(slice_size >= row_size, "{rows} rows: slice {slice_size}");
+            assert!(
+                slice_size.is_multiple_of(row_size),
+                "{rows} rows: slice {slice_size}"
+            );
+        }
+        assert_eq!(
+            reassembly_slice_size(READ_SIZE, row_size),
+            READ_SIZE / CONCURRENCY_INNER
+        );
+    }
+
+    #[cfg(all(target_os = "linux", feature = "rdma-tests"))]
+    fn supports_o_direct(dir: &std::path::Path) -> bool {
+        let probe = dir.join("o_direct_probe");
+        std::fs::write(&probe, [0u8; 4096]).is_ok()
+            && open(
+                probe.as_path(),
+                OFlag::O_RDONLY | OFlag::O_DIRECT,
+                Mode::empty(),
+            )
+            .is_ok()
+    }
+
+    #[cfg(all(target_os = "linux", feature = "rdma-tests"))]
+    #[test]
+    fn row_segment_with_short_tail_chunk_loads() {
+        let dir = tempfile::tempdir().unwrap();
+        if !supports_o_direct(dir.path()) {
+            eprintln!(
+                "skipping: {} does not support O_DIRECT",
+                dir.path().display()
+            );
+            return;
+        }
+        let row_size = 2048;
+        let tensor_size = READ_SIZE + (CONCURRENCY_INNER - 1) * row_size;
+        let ckpt = dir.path().join("run/elapsed_samples_1/orbax-ckpt");
+        std::fs::create_dir_all(&ckpt).unwrap();
+        let data: Vec<u8> = (0..tensor_size).map(|i| (i % 251) as u8).collect();
+        std::fs::write(ckpt.join("shard"), &data).unwrap();
+        let shard_sources = [(
+            "emb_table/c/0/0".to_string(),
+            "shard".to_string(),
+            0,
+            tensor_size,
+        )];
+
+        let mut tensor = vec![0u8; tensor_size];
+        load_tensor_into(
+            ckpt.to_str().unwrap(),
+            "",
+            &shard_sources,
+            &mut tensor,
+            row_size,
+            1,
+        )
+        .unwrap();
+        assert!(tensor == data, "loaded tensor differs from the shard file");
     }
 }

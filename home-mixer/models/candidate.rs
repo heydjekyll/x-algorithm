@@ -2,6 +2,7 @@ use crate::models::brand_safety::BrandSafetyVerdict;
 use crate::models::content_features;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use xai_candidate_pipeline::component_library::clients::phoenix_retrieval_client::PhoenixRetrievalCluster;
 pub use xai_candidate_pipeline::component_library::models::PhoenixScores;
 use xai_home_mixer_proto as pb;
 use xai_recsys_proto::SAFETY_BIT_AUTHOR_NSFW;
@@ -22,6 +23,8 @@ pub struct PostCandidate {
     pub last_scored_at_ms: Option<u64>,
     pub weighted_score: Option<f64>,
     pub score: Option<f64>,
+    #[serde(default)]
+    pub cold_start_lift_to_rank: Option<u32>,
     pub slate_context: Option<SlateContext>,
     #[serde(default)]
     pub served_slate_context: Option<SlateContext>,
@@ -34,6 +37,8 @@ pub struct PostCandidate {
         deserialize_with = "deserialize_served_type"
     )]
     pub served_type: Option<pb::ServedType>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub retrieval_sources: Vec<RetrievalSource>,
     pub in_network: Option<bool>,
     pub ancestors: Vec<u64>,
     pub tombstone_ancestor_ids: Vec<u64>,
@@ -44,6 +49,10 @@ pub struct PostCandidate {
     pub max_video_duration_ms: Option<i32>,
     pub has_photo: Option<bool>,
     pub has_video: Option<bool>,
+    #[serde(default)]
+    pub video_aspect_ratio: Option<f32>,
+    #[serde(default)]
+    pub video_carousel_extra: bool,
     pub media_count: Option<i32>,
     pub quoted_video_duration_ms: Option<i32>,
     pub quoted_has_media: Option<bool>,
@@ -92,6 +101,29 @@ pub struct PostCandidate {
     pub grok_topics: Option<Vec<String>>,
     pub ai_trend_name: Option<String>,
     pub ai_trend_id: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct RetrievalSource {
+    #[serde(
+        serialize_with = "serialize_served_type_value",
+        deserialize_with = "deserialize_served_type_value"
+    )]
+    pub served_type: pb::ServedType,
+    pub cluster: Option<PhoenixRetrievalCluster>,
+    pub score: Option<f32>,
+    pub position: Option<u32>,
+}
+
+impl RetrievalSource {
+    pub fn from_served_type(served_type: pb::ServedType) -> Self {
+        Self {
+            served_type,
+            cluster: None,
+            score: None,
+            position: None,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -176,6 +208,24 @@ where
     }
 }
 
+fn serialize_served_type_value<S>(
+    served_type: &pb::ServedType,
+    serializer: S,
+) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    (*served_type as i32).serialize(serializer)
+}
+
+fn deserialize_served_type_value<'de, D>(deserializer: D) -> Result<pb::ServedType, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    pb::ServedType::try_from(i32::deserialize(deserializer)?)
+        .map_err(|_| serde::de::Error::custom("invalid ServedType value"))
+}
+
 pub trait CandidateHelpers {
     fn get_screen_names(&self) -> HashMap<u64, String>;
     fn get_original_tweet_id(&self) -> u64;
@@ -241,6 +291,8 @@ impl CandidateHelpers for PostCandidate {
             reward_rerank_slot_prob: None,
             page_decode_slot_prob: None,
             reranker_head_tag: self.reranker_head_tag,
+            prediction_heads: Vec::new(),
+            prediction_values: Vec::new(),
         }
     }
 

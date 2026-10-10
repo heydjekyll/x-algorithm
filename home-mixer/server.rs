@@ -7,12 +7,12 @@ use crate::clients::gizmoduck_client::{
     GizmoduckClient, MockGizmoduckClient, ProdGizmoduckClient, ViewerData,
 };
 use crate::clients::resurrection_date_client::{
-    compute_resurrection_fs_fields, MockResurrectionDateClient, ProdResurrectionDateClient,
-    ResurrectionDateClient,
+    MockResurrectionDateClient, ProdResurrectionDateClient, ResurrectionDateClient,
 };
 use crate::following_feed_server::FollowingFeedServer;
 use crate::for_you_server::ForYouFeedServer;
 use crate::models::candidate::PostCandidate;
+use crate::models::fs_recipient::FsRecipientInputs;
 use crate::models::query::{RequestType, ScoredPostsQuery};
 use crate::params;
 use crate::phoenix_scores_server::{build_query_builder_input, PhoenixScoresServer};
@@ -26,11 +26,10 @@ use tonic::{Request, Response, Status};
 use tracing::{info_span, Instrument};
 use xai_candidate_pipeline::candidate_pipeline::PipelineResult;
 use xai_candidate_pipeline::component_library::utils::{
-    creation_epoch_days, days_since_creation, duration_since_creation_opt, generate_request_id,
-    non_zero, resolve_request_id,
+    generate_request_id, non_zero, resolve_request_id,
 };
 use xai_decider::{Decider, DeciderStore};
-use xai_feature_switches::{FeatureSwitches, RecipientBuilder};
+use xai_feature_switches::FeatureSwitches;
 use xai_home_mixer_proto as pb;
 use xai_home_mixer_proto::{
     DebugPhoenixScoresResponse, DebugScoredPostsResponse, FollowingFeedResponse,
@@ -53,7 +52,9 @@ pub struct RequestContext {
 
 pub(crate) struct PipelineOutput {
     pub scored_posts: Vec<ScoredPost>,
+    pub video_carousel: Option<pb::VideoCarouselModule>,
     pub pipeline_result: PipelineResult<ScoredPostsQuery, PostCandidate>,
+    pub pipeline_trace: Option<pb::PipelineTrace>,
 }
 
 pub struct HomeMixerConfig {
@@ -95,14 +96,27 @@ impl QueryBuilder {
         let in_network_only =
             proto_query.in_network_only || viewer_data.allow_for_you_recommendations == Some(false);
 
-        let params = self.evaluate_feature_switches(
-            &proto_query,
-            request_type,
-            &viewer_data.roles,
-            viewer_data.has_phone_number,
+        let fs_recipient_inputs = FsRecipientInputs {
+            user_id: proto_query.viewer_id,
+            country_code: proto_query.country_code.clone(),
+            language_code: proto_query.language_code.clone(),
+            client_app_id: proto_query.client_app_id as i64,
+            client_version: proto_query
+                .device_status
+                .as_ref()
+                .map(|d| d.client_version.clone()),
+            user_roles: viewer_data.roles.clone(),
+            datacenter: self.datacenter.clone(),
+            has_phone_number: viewer_data.has_phone_number,
             resurrection_time_ms,
-            &fs_overrides,
-        );
+            product: request_type.to_string(),
+            now_ms: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as i64,
+            fs_overrides,
+        };
+        let params = self.evaluate_feature_switches(&fs_recipient_inputs);
 
         let push_to_home_post_id = non_zero(proto_query.push_to_home_post_id);
         let device_status = proto_query.device_status.unwrap_or_default();
@@ -144,6 +158,9 @@ impl QueryBuilder {
         );
         query.request_type = request_type;
         query.resurrection_time_ms = resurrection_time_ms;
+        query.fs_recipient_inputs = Some(fs_recipient_inputs);
+        query.is_under_the_hood_request =
+            proto_query.is_under_the_hood_request && query.params.get(params::EnableUnderTheHood);
 
         query.dsp_client_context = proto_query.dsp_client_context;
 
@@ -164,59 +181,18 @@ impl QueryBuilder {
 
     fn evaluate_feature_switches(
         &self,
-        proto_query: &pb::ScoredPostsQuery,
-        request_type: RequestType,
-        user_roles: &[String],
-        has_phone_number: bool,
-        resurrection_time_ms: Option<i64>,
-        fs_overrides: &std::collections::HashMap<String, String>,
+        inputs: &FsRecipientInputs,
     ) -> xai_feature_switches::Params {
-        let now_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as i64;
-        let account_age_days = days_since_creation(proto_query.viewer_id);
-        let account_creation_date = creation_epoch_days(proto_query.viewer_id);
-        let account_age_minutes = duration_since_creation_opt(proto_query.viewer_id)
-            .map(|age| (age.as_secs() / 60) as i64);
+        let mut results = self.feature_switches.match_recipient(&inputs.recipient());
 
-        let (user_resurrected_date, days_since_resurrection) =
-            compute_resurrection_fs_fields(now_ms, resurrection_time_ms);
-        let minutes_since_resurrection = resurrection_time_ms
-            .filter(|&t| t >= 0)
-            .map(|t| (now_ms - t) / 60_000);
-        let client_version = proto_query
-            .device_status
-            .as_ref()
-            .map(|d| d.client_version.as_str());
-
-        let recipient = RecipientBuilder::new()
-            .user_id(proto_query.viewer_id)
-            .country(&proto_query.country_code)
-            .language(&proto_query.language_code)
-            .client_app_id(proto_query.client_app_id as i64)
-            .client_version_opt(client_version)
-            .user_roles(user_roles.iter().cloned())
-            .custom_string("datacenter", &self.datacenter)
-            .custom_i64("account_age_days", account_age_days)
-            .custom_i64("account_creation_date", account_creation_date)
-            .custom_bool("has_phone_number", has_phone_number)
-            .custom_string("product", request_type.to_string())
-            .custom_opt_i64("user_resurrected_date", user_resurrected_date)
-            .custom_opt_i64("days_since_resurrection", days_since_resurrection)
-            .custom_opt_i64("account_age_minutes", account_age_minutes)
-            .custom_opt_i64("minutes_since_resurrection", minutes_since_resurrection)
-            .build();
-        let mut results = self.feature_switches.match_recipient(&recipient);
-
-        if !fs_overrides.is_empty() {
-            for (key, value) in fs_overrides {
+        if !inputs.fs_overrides.is_empty() {
+            for (key, value) in &inputs.fs_overrides {
                 results.override_fs(key.clone(), value);
             }
             tracing::info!(
                 "Applied {} FS overrides: {:?}",
-                fs_overrides.len(),
-                fs_overrides.keys().collect::<Vec<_>>()
+                inputs.fs_overrides.len(),
+                inputs.fs_overrides.keys().collect::<Vec<_>>()
             );
         }
 
@@ -340,6 +316,7 @@ impl pb::scored_posts_service_server::ScoredPostsService for ScoredPostsServer {
         let mut response = Response::new(DebugScoredPostsResponse {
             scored_posts: output.scored_posts,
             debug_json,
+            pipeline_trace: output.pipeline_trace,
         });
         b3_info.inject_trace_response_header(&mut response);
         Ok(response)
@@ -377,6 +354,7 @@ impl pb::for_you_feed_service_server::ForYouFeedService for ForYouFeedServer {
 
         let mut response = Response::new(ForYouFeedResponse {
             items: output.items,
+            pipeline_trace: output.pipeline_trace,
         });
         b3_info.inject_trace_response_header(&mut response);
         Ok(response)
@@ -472,6 +450,7 @@ impl pb::for_you_feed_service_server::ForYouFeedService for ForYouFeedServer {
 
         let mut response = Response::new(ForYouFeedResponse {
             items: output.items,
+            pipeline_trace: output.pipeline_trace,
         });
         b3_info.inject_trace_response_header(&mut response);
         Ok(response)

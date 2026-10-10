@@ -1,7 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 X.AI Corp.
-from typing import Optional
-
 import jax.numpy as jnp
 
 from xai_configlib import configclass
@@ -12,12 +10,9 @@ from xrex.models.sharding_context import NamedShape
 @configclass
 class RecsysAttentionConfig(AttentionConfig):
     history_seq_len: int = 1024
+    candidate_seq_len: int = 128
     sequence_len: int = 1152
     num_user_prefix_tokens: int = 1
-
-    attn_grad_clip: float = 0.0
-    q_seg_ids_fn: Optional[str] = None
-    k_seg_ids_fn: Optional[str] = None
 
 
 class PallasRankerAttention(CustomAttention):
@@ -29,12 +24,13 @@ class PallasRankerAttention(CustomAttention):
             assert not self.config.causal, "Causal attention is not supported"
             assert self.config.key_size % 64 == 0, "key_size must be a multiple of 64"
 
-            from xrex.pallas import ranker_attention_fa3
             from xrex.utils.gpu import GpuArch, gpu_arch
 
             use_fa3 = gpu_arch() == GpuArch.H100 and str(self.config.fa_version) != "2"
 
             if use_fa3:
+                from xrex.pallas import ranker_attention_fa3
+
                 block_q = 64
                 block_kv = 64
                 assert q.shape[1] % (block_q * 2) == 0 and k.shape[1] % block_kv == 0, (
@@ -99,12 +95,13 @@ class PallasRankerAttentionInference(CustomAttention):
             assert not self.config.causal, "Causal attention is not supported"
             assert self.config.key_size % 64 == 0, "key_size must be a multiple of 64"
 
-            from xrex.pallas import ranker_attention_fa3
             from xrex.utils.gpu import GpuArch, gpu_arch
 
             use_h100_kernel = gpu_arch() == GpuArch.H100
 
             if use_h100_kernel:
+                from xrex.pallas import ranker_attention_fa3
+
                 block_q = 64
                 block_kv = 128
                 assert q.shape[1] % (block_q * 2) == 0 and k.shape[1] % block_kv == 0, (
@@ -198,19 +195,21 @@ class CutedslRankerAttention(CustomAttention):
     def sharded_custom_op_with_extra_args(self):
         assert isinstance(self.config, RecsysAttentionConfig)
         assert not self.config.causal, "CuTeDSL FA4 does not support causal attention"
-        assert self.config.attn_logit_cap <= 0, (
-            f"CuTeDSL FA4 does not support softcap (got attn_logit_cap={self.config.attn_logit_cap}). "
-            f"Use qk_norm=True instead."
-        )
-        assert self.config.qk_norm, "CuTeDSL FA4 requires qk_norm=True for stable training"
+        has_cap = self.config.attn_logit_cap > 0 and self.config.attn_logit_cap_method != "none"
         from xrex.utils.gpu import GpuArch, gpu_arch
 
         arch = gpu_arch()
         assert arch in (GpuArch.A100, GpuArch.H100, GpuArch.GB200, GpuArch.GB300), (
             f"CuTeDSL ranker attention requires A100, H100, GB200 or GB300 (got {arch})"
         )
+        assert not (has_cap and arch == GpuArch.A100), (
+            "CuTeDSL FA4 attn_logit_cap is SM90/SM100 only (SM80 rejects score_mod with block "
+            "sparsity); use qk_norm=True with attn_logit_cap=-1 on A100"
+        )
         config = self.config
         sm_scale = self.scale_config.attn_output_scale(self.config.key_size)
+        cap = config.attn_logit_cap if has_cap else -1.0
+        cap_method = config.attn_logit_cap_method
 
         from xrex.cutedsl.ranker_attention_fa4 import (
             build_dense_block_sparse_layout,
@@ -234,6 +233,8 @@ class CutedslRankerAttention(CustomAttention):
                     (fwd_bs, bwd_bs),
                     valid_block_upper=valid_upper,
                     valid_block_lower=valid_lower,
+                    cap=cap,
+                    cap_method=cap_method,
                 ),
                 None,
             )
@@ -246,19 +247,25 @@ class CutedslRankerVarlenAttention(CustomAttention):
         assert isinstance(self.config, RecsysAttentionConfig)
         assert not self.config.causal, "CuTeDSL FA4 does not support causal attention"
         assert self.config.attn_logit_cap <= 0, (
-            f"CuTeDSL FA4 does not support softcap (got attn_logit_cap={self.config.attn_logit_cap}). "
-            f"Use qk_norm=True instead."
+            "The packed CuTeDSL FA4 wrapper does not wire the attn_logit_cap score_mod "
+            f"(got attn_logit_cap={self.config.attn_logit_cap}); use qk_norm=True, or "
+            "cutedsl_ranker_attn for a capped model"
         )
         assert self.config.qk_norm, "CuTeDSL FA4 requires qk_norm=True for stable training"
         from xrex.utils.gpu import GpuArch, gpu_arch
 
         arch = gpu_arch()
-        assert arch in (GpuArch.H100, GpuArch.GB200, GpuArch.GB300), (
-            f"CuTeDSL ranker varlen attention requires H100, GB200 or GB300 (got {arch})"
+        assert arch in (GpuArch.A100, GpuArch.H100, GpuArch.GB200, GpuArch.GB300), (
+            f"CuTeDSL ranker varlen attention requires A100, H100, GB200 or GB300 (got {arch})"
         )
         sm_scale = self.scale_config.attn_output_scale(self.config.key_size)
 
-        from xrex.cutedsl.ranker_attention_varlen_fa4 import ranker_attention_varlen_fa4
+        from xrex.cutedsl.ranker_attention_varlen_fa4 import (
+            ranker_attention_varlen_fa4,
+        )
+        from xrex.cutedsl.ranker_candidate_attention_fa4 import (
+            ranker_candidate_attention_fa4,
+        )
 
         def sharded_mha(
             q,
@@ -281,6 +288,7 @@ class CutedslRankerVarlenAttention(CustomAttention):
             bsp_bwd_diag_idx,
             bsp_valid_block_upper,
             bsp_valid_block_lower,
+            *candidate_region_args,
         ):
             del segment_ids, segment_ids_k, temp
             fwd_bs = (
@@ -299,8 +307,25 @@ class CutedslRankerVarlenAttention(CustomAttention):
                 bsp_bwd_diag_cnt,
                 bsp_bwd_diag_idx,
             )
-            return (
-                ranker_attention_varlen_fa4(
+            if candidate_region_args:
+                candidate_cu_seqlens, candidate_token_to_slot, key_starts, key_counts = (
+                    candidate_region_args
+                )
+                attn_out = ranker_candidate_attention_fa4(
+                    q,
+                    k,
+                    v,
+                    sm_scale,
+                    (fwd_bs, bwd_bs),
+                    bsp_valid_block_upper,
+                    bsp_valid_block_lower,
+                    candidate_cu_seqlens[0],
+                    key_starts[0],
+                    key_counts[0],
+                    history_region_len=q.shape[1] - candidate_token_to_slot.shape[-1],
+                )
+            else:
+                attn_out = ranker_attention_varlen_fa4(
                     q,
                     k,
                     v,
@@ -308,9 +333,8 @@ class CutedslRankerVarlenAttention(CustomAttention):
                     block_sparse_layout=(fwd_bs, bwd_bs),
                     valid_block_upper=bsp_valid_block_upper,
                     valid_block_lower=bsp_valid_block_lower,
-                ),
-                None,
-            )
+                )
+            return attn_out, None
 
         def _rep(s):
             return NamedShape(s, ("batch_attn",) + tuple("replicated" for _ in s[1:]))
@@ -332,4 +356,14 @@ class CutedslRankerVarlenAttention(CustomAttention):
             "bsp_valid_block_lower",
         )
         extras = tuple((name, _rep) for name in bsp_names)
+        if kwargs.get("candidate_cu_seqlens") is not None:
+            extras += tuple(
+                (name, _rep)
+                for name in (
+                    "candidate_cu_seqlens",
+                    "candidate_token_to_slot",
+                    "candidate_key_starts",
+                    "candidate_key_counts",
+                )
+            )
         return sharded_mha, extras
