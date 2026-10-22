@@ -2,9 +2,11 @@ use crate::models::brand_safety::BrandSafetyVerdict;
 use crate::models::content_features;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::sync::Arc;
 use xai_candidate_pipeline::component_library::clients::phoenix_retrieval_client::PhoenixRetrievalCluster;
 pub use xai_candidate_pipeline::component_library::models::PhoenixScores;
 use xai_home_mixer_proto as pb;
+use xai_proto::engagement_counter::PostEngagers;
 use xai_recsys_proto::SAFETY_BIT_AUTHOR_NSFW;
 use xai_visibility_filtering::models as vf;
 
@@ -32,6 +34,10 @@ pub struct PostCandidate {
     pub reranker_head_tag: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub backbone_scores: Option<PhoenixScores>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub immersive_scores: Option<PhoenixScores>,
+    #[serde(skip)]
+    pub video_embedding: Option<Vec<f32>>,
     #[serde(
         serialize_with = "serialize_served_type",
         deserialize_with = "deserialize_served_type"
@@ -43,7 +49,11 @@ pub struct PostCandidate {
     pub ancestors: Vec<u64>,
     pub tombstone_ancestor_ids: Vec<u64>,
     pub ancestor_users: Vec<u64>,
+    #[serde(default)]
+    pub conversation_id: Option<u64>,
     pub ancestor_texts: HashMap<u64, String>,
+    #[serde(default)]
+    pub ancestor_has_video: Option<bool>,
     pub quoted_tweet_text: Option<String>,
     pub min_video_duration_ms: Option<i32>,
     pub max_video_duration_ms: Option<i32>,
@@ -51,6 +61,10 @@ pub struct PostCandidate {
     pub has_video: Option<bool>,
     #[serde(default)]
     pub video_aspect_ratio: Option<f32>,
+    #[serde(default)]
+    pub video_media_id: Option<u64>,
+    #[serde(default)]
+    pub video_md5_hashes: Option<Vec<String>>,
     #[serde(default)]
     pub video_carousel_extra: bool,
     pub media_count: Option<i32>,
@@ -92,6 +106,8 @@ pub struct PostCandidate {
     pub nsfw_author: Option<bool>,
     pub nsfw_author_ads: Option<bool>,
     pub nsfw_author_phoenix: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub soft_nsfw: Option<bool>,
     #[serde(default)]
     pub safety_labels: Vec<SafetyLabelInfo>,
     #[serde(default)]
@@ -101,6 +117,8 @@ pub struct PostCandidate {
     pub grok_topics: Option<Vec<String>>,
     pub ai_trend_name: Option<String>,
     pub ai_trend_id: Option<String>,
+    #[serde(skip)]
+    pub post_engagers: Option<Arc<PostEngagers>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]

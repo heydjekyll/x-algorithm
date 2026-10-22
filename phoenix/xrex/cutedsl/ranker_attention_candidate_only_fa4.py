@@ -7,7 +7,7 @@ from jax.ad_checkpoint import checkpoint_name
 _CANDIDATE_ATTENTION_CACHE: dict = {}
 
 
-def _candidate_attention_fwd_bwd(q_shape, k_shape, num_seqs, sm_scale):
+def candidate_attention_fwd_bwd(q_shape, k_shape, num_seqs, sm_scale):
     from xrex.cutedsl.ranker_attention_fa4 import cutedsl_arch
     from xrex.cutedsl.ranker_attention_varlen_fa4 import zeros_after
 
@@ -27,34 +27,54 @@ def _candidate_attention_fwd_bwd(q_shape, k_shape, num_seqs, sm_scale):
     from xrex.cutedsl.ranker_fa4.flash_bwd_postprocess import FlashAttentionBackwardPostprocess
     from xrex.cutedsl.ranker_fa4.flash_bwd_preprocess import FlashAttentionBackwardPreprocess
 
-    if arch != 90:
-        raise NotImplementedError("ranker candidate attention: only SM90 (H100) is supported")
-    from xrex.cutedsl.ranker_fa4.flash_bwd_sm90 import FlashAttentionBackwardSm90
-    from xrex.cutedsl.ranker_fa4.flash_fwd_sm90 import FlashAttentionForwardSm90
+    if arch not in (90, 100):
+        raise NotImplementedError(
+            "ranker candidate attention: only SM90 (H100) and SM100 (GB200/GB300) are supported"
+        )
 
     qpk = num_q_heads // num_kv_heads
+    q_heads_per_bwd_head = qpk if arch == 90 else 1
+    bwd_qpk = qpk // q_heads_per_bwd_head
+    bwd_rows, bwd_num_heads = total_q * q_heads_per_bwd_head, num_q_heads // q_heads_per_bwd_head
     tile_n = 128
-    bwd_tile_m = 64
+    bwd_tile_m = 64 if arch == 90 else 128
     hdr = ((head_dim + 31) // 32) * 32
-    total_q_padded = (total_q + num_seqs * bwd_tile_m + bwd_tile_m - 1) // bwd_tile_m * bwd_tile_m
+    bwd_rows_padded = (bwd_rows + num_seqs * bwd_tile_m + bwd_tile_m - 1) // bwd_tile_m * bwd_tile_m
     total_k_padded = (total_k + num_seqs * tile_n + tile_n - 1) // tile_n * tile_n
 
-    fa_fwd = FlashAttentionForwardSm90(
-        cutlass.BFloat16,
-        head_dim,
-        head_dim,
-        qpk,
-        is_causal=False,
-        is_local=False,
-        pack_gqa=qpk > 1,
-        tile_m=128,
-        tile_n=tile_n,
-        num_stages=2,
-        num_threads=384,
-        Q_in_regs=False,
-        intra_wg_overlap=True,
-        mma_pv_is_rs=True,
-    )
+    if arch == 90:
+        from xrex.cutedsl.ranker_fa4.flash_fwd_sm90 import FlashAttentionForwardSm90
+
+        fa_fwd = FlashAttentionForwardSm90(
+            cutlass.BFloat16,
+            head_dim,
+            head_dim,
+            qpk,
+            is_causal=False,
+            is_local=False,
+            pack_gqa=qpk > 1,
+            tile_m=128,
+            tile_n=tile_n,
+            num_stages=2,
+            num_threads=384,
+            Q_in_regs=False,
+            intra_wg_overlap=True,
+            mma_pv_is_rs=True,
+        )
+    else:
+        from xrex.cutedsl.ranker_fa4.flash_fwd_sm100 import FlashAttentionForwardSm100
+
+        fa_fwd = FlashAttentionForwardSm100(
+            head_dim=head_dim,
+            head_dim_v=head_dim,
+            qhead_per_kvhead=qpk,
+            is_causal=False,
+            is_local=False,
+            pack_gqa=qpk > 1 and 128 % qpk == 0,
+            q_stage=1,
+            is_persistent=False,
+            is_varlen_q=True,
+        )
 
     @cute.jit
     def launch_fwd(
@@ -92,42 +112,58 @@ def _candidate_attention_fwd_bwd(q_shape, k_shape, num_seqs, sm_scale):
     pre_call = cutlass_call(
         launch_pre,
         output_shape_dtype=[
-            jax.ShapeDtypeStruct((num_q_heads, total_q_padded), jnp.float32),
-            jax.ShapeDtypeStruct((num_q_heads, total_q_padded), jnp.float32),
+            jax.ShapeDtypeStruct((bwd_num_heads, bwd_rows_padded), jnp.float32),
+            jax.ShapeDtypeStruct((bwd_num_heads, bwd_rows_padded), jnp.float32),
         ],
         use_static_tensors=False,
     )
 
-    bwd_atom_layout_dkv = 2
-    fa_bwd = FlashAttentionBackwardSm90(
-        cutlass.BFloat16,
-        head_dim,
-        head_dim,
-        qpk,
-        False,
-        is_local=False,
-        deterministic=False,
-        tile_m=bwd_tile_m,
-        tile_n=tile_n,
-        Q_stage=2,
-        dO_stage=2,
-        PdS_stage=2,
-        SdP_swapAB=True,
-        dKV_swapAB=False,
-        dQ_swapAB=False,
-        AtomLayoutMSdP=1,
-        AtomLayoutNdKV=bwd_atom_layout_dkv,
-        AtomLayoutMdQ=1,
-        num_threads=384,
-    )
-    dkv_postprocess = qpk > 1
+    if arch == 90:
+        from xrex.cutedsl.ranker_fa4.flash_bwd_sm90 import FlashAttentionBackwardSm90
+
+        bwd_atom_layout_dkv = 2
+        fa_bwd = FlashAttentionBackwardSm90(
+            cutlass.BFloat16,
+            head_dim,
+            head_dim,
+            bwd_qpk,
+            False,
+            is_local=False,
+            deterministic=False,
+            tile_m=bwd_tile_m,
+            tile_n=tile_n,
+            Q_stage=2,
+            dO_stage=2,
+            PdS_stage=2,
+            SdP_swapAB=True,
+            dKV_swapAB=False,
+            dQ_swapAB=False,
+            AtomLayoutMSdP=1,
+            AtomLayoutNdKV=bwd_atom_layout_dkv,
+            AtomLayoutMdQ=1,
+            num_threads=384,
+        )
+        post_threads = 256
+    else:
+        from xrex.cutedsl.ranker_fa4.flash_bwd_sm100 import FlashAttentionBackwardSm100
+
+        bwd_atom_layout_dkv = 1
+        fa_bwd = FlashAttentionBackwardSm100(
+            head_dim=head_dim,
+            head_dim_v=head_dim,
+            qhead_per_kvhead=qpk,
+            is_causal=False,
+            is_local=False,
+        )
+        post_threads = 128
+    dkv_postprocess = bwd_qpk > 1
     dkv_out = jax.ShapeDtypeStruct(
         (num_kv_heads, total_k_padded * hdr)
         if dkv_postprocess
         else (total_k, num_kv_heads, head_dim),
         jnp.float32 if dkv_postprocess else jnp.bfloat16,
     )
-    dq_accum_shape = (num_q_heads, total_q_padded * hdr)
+    dq_accum_shape = (bwd_num_heads, bwd_rows_padded * hdr)
 
     @cute.jit
     def launch_bwd(
@@ -182,7 +218,7 @@ def _candidate_attention_fwd_bwd(q_shape, k_shape, num_seqs, sm_scale):
             head_dim,
             arch,
             tile_m=tile_m,
-            num_threads=256,
+            num_threads=post_threads,
             AtomLayoutMdQ=atom_layout,
         )
 
@@ -208,11 +244,23 @@ def _candidate_attention_fwd_bwd(q_shape, k_shape, num_seqs, sm_scale):
         )
 
     kv_shape = (total_k, num_kv_heads, head_dim)
-    post_dq = postprocess(bwd_tile_m, 1, (total_q, num_q_heads, head_dim), sm_scale, False)
+    post_dq = postprocess(bwd_tile_m, 1, (bwd_rows, bwd_num_heads, head_dim), sm_scale, False)
     post_dk = post_dv = None
     if dkv_postprocess:
         post_dk = postprocess(tile_n, bwd_atom_layout_dkv, kv_shape, sm_scale, True)
         post_dv = postprocess(tile_n, bwd_atom_layout_dkv, kv_shape, 1.0, True)
+
+    def fold_q_heads(x):
+        if q_heads_per_bwd_head == 1:
+            return x
+        x = x.reshape(total_q, bwd_num_heads, q_heads_per_bwd_head, *x.shape[2:]).swapaxes(1, 2)
+        return x.reshape(bwd_rows, bwd_num_heads, *x.shape[3:])
+
+    def unfold_q_heads(x):
+        if q_heads_per_bwd_head == 1:
+            return x
+        x = x.reshape(total_q, q_heads_per_bwd_head, bwd_num_heads, *x.shape[2:]).swapaxes(1, 2)
+        return x.reshape(total_q, num_q_heads, *x.shape[3:])
 
     def self_scores(q, k_self, query_valid):
         k_rep = jnp.repeat(k_self, qpk, axis=1)
@@ -236,32 +284,34 @@ def _candidate_attention_fwd_bwd(q_shape, k_shape, num_seqs, sm_scale):
     def backward(q, k_keys, v_keys, k_self, v_self, cu_q, cu_k, used_k, o, lse, do):
         query_valid = jnp.arange(total_q) < cu_q[-1]
         do = jnp.where(query_valid[:, None, None], do, 0).astype(jnp.bfloat16)
-        dpsum, lse_log2 = pre_call(o, do, lse.T, cu_q)
+        bwd_cu_rows = cu_q if q_heads_per_bwd_head == 1 else cu_q * q_heads_per_bwd_head
+        bwd_do = fold_q_heads(do)
+        dpsum, lse_log2 = pre_call(fold_q_heads(o), bwd_do, fold_q_heads(lse).T, bwd_cu_rows)
         dq_accum = zeros_after(dq_accum_shape, jnp.float32, do)
         dk_init = zeros_after(dkv_out.shape, dkv_out.dtype, do)
         dv_init = zeros_after(dkv_out.shape, dkv_out.dtype, do)
         dq_accum, dk_keys, dv_keys = bwd_call(
-            q,
+            fold_q_heads(q),
             k_keys,
             v_keys,
-            do,
+            bwd_do,
             lse_log2,
             dpsum,
-            cu_q,
+            bwd_cu_rows,
             cu_k,
             used_k,
             dq_accum,
             dk_init,
             dv_init,
         )
-        (dq,) = post_dq(dq_accum, cu_q)
+        (dq,) = post_dq(dq_accum, bwd_cu_rows)
         if post_dk is not None and post_dv is not None:
             (dk_keys,) = post_dk(dk_keys, cu_k, used_k)
             (dv_keys,) = post_dv(dv_keys, cu_k, used_k)
         marks = jnp.zeros(total_k + 1, jnp.int32).at[cu_k[:-1]].add(1)
         marks = marks.at[cu_k[:-1] + used_k].add(-1)
         key_valid = jnp.cumsum(marks[:-1]) > 0
-        dq = jnp.where(query_valid[:, None, None], dq, 0)
+        dq = jnp.where(query_valid[:, None, None], unfold_q_heads(dq), 0)
         dk_keys = jnp.where(key_valid[:, None, None], dk_keys, 0)
         dv_keys = jnp.where(key_valid[:, None, None], dv_keys, 0)
 
@@ -292,78 +342,57 @@ def _candidate_attention_fwd_bwd(q_shape, k_shape, num_seqs, sm_scale):
     return forward, backward
 
 
-def ranker_candidate_attention_fa4(
-    q,
-    k,
-    v,
-    sm_scale,
-    block_sparse_layout,
-    valid_block_upper,
-    valid_block_lower,
+def ranker_attention_varlen_candidate_only_fa4(
+    candidate_q,
+    history_k,
+    history_v,
+    own_k,
+    own_v,
     candidate_cu_seqlens,
-    candidate_key_starts,
-    candidate_key_counts,
-    history_region_len,
+    history_key_starts,
+    history_key_counts,
+    sm_scale,
 ):
-    from xrex.cutedsl.ranker_attention_varlen_fa4 import (
-        varlen_backward,
-        varlen_forward,
-        varlen_kernels,
+    forward, backward = candidate_attention_fwd_bwd(
+        candidate_q.shape, history_k.shape, candidate_cu_seqlens.shape[0] - 1, sm_scale
     )
-
-    assert q.shape[0] == 1, "one packed sequence per device"
-    region_start = int(history_region_len)
-    kernels, bs_args = varlen_kernels(
-        q, k, v, sm_scale, block_sparse_layout, valid_block_upper, valid_block_lower
-    )
-    cand_forward, cand_backward = _candidate_attention_fwd_bwd(
-        q[0, region_start:].shape, k[0].shape, candidate_cu_seqlens.shape[0] - 1, sm_scale
-    )
-
-    def candidate_inputs(q, k, v, cand_cu, key_starts, key_counts):
-        keys, values = k[0], v[0]
-        return (
-            q[0, region_start:],
-            keys,
-            values,
-            keys[region_start:],
-            values[region_start:],
-            cand_cu,
-            key_starts,
-            key_counts,
-        )
-
-    def forward(q, k, v, cand_cu, key_starts, key_counts, bs_args):
-        out, lse = varlen_forward(kernels, q, k, v, bs_args)
-        cand_o, cand_lse = cand_forward(*candidate_inputs(q, k, v, cand_cu, key_starts, key_counts))
-        return out.at[0, region_start:].set(cand_o), lse, cand_lse
 
     @jax.custom_vjp
-    def attention(q, k, v, cand_cu, key_starts, key_counts, *bs_args):
-        return forward(q, k, v, cand_cu, key_starts, key_counts, bs_args)[0]
+    def attention(*args):
+        return forward(*args)[0]
 
-    def attention_fwd(q, k, v, cand_cu, key_starts, key_counts, *bs_args):
-        out, lse, cand_lse = forward(q, k, v, cand_cu, key_starts, key_counts, bs_args)
-        out = checkpoint_name(out, "cutedsl_attn_outputs")
+    def attention_fwd(*args):
+        o, lse = forward(*args)
+        o = checkpoint_name(o, "cutedsl_attn_outputs")
         lse = checkpoint_name(lse, "cutedsl_attn_outputs")
-        cand_lse = checkpoint_name(cand_lse, "cutedsl_attn_outputs")
-        return out, (q, k, v, cand_cu, key_starts, key_counts, out, lse, cand_lse, bs_args)
+        return o, (*args, o, lse)
 
-    def attention_bwd(res, g):
-        q, k, v, cand_cu, key_starts, key_counts, out, lse, cand_lse, bs_args = res
-        dq, dk, dv = varlen_backward(kernels, q, k, v, out, lse, bs_args, g)
-        dq_cand, dk_keys, dv_keys, dk_self, dv_self = cand_backward(
-            *candidate_inputs(q, k, v, cand_cu, key_starts, key_counts),
-            out[0, region_start:],
-            cand_lse,
-            g[0, region_start:],
-        )
-        dq = dq.at[0, region_start:].set(dq_cand)
-        dk = (dk.at[0].add(dk_keys)).at[0, region_start:].add(dk_self)
-        dv = (dv.at[0].add(dv_keys)).at[0, region_start:].add(dv_self)
-        return (dq, dk, dv, None, None, None) + (None,) * len(bs_args)
+    def attention_bwd(res, do):
+        return backward(*res, do) + (None, None, None)
 
     attention.defvjp(attention_fwd, attention_bwd)
     return attention(
-        q, k, v, candidate_cu_seqlens, candidate_key_starts, candidate_key_counts, *bs_args
+        candidate_q,
+        history_k,
+        history_v,
+        own_k,
+        own_v,
+        candidate_cu_seqlens,
+        history_key_starts,
+        history_key_counts,
     )
+
+
+def ranker_attention_candidate_only_fa4(
+    candidate_q, history_k, history_v, own_k, own_v, hist_valid_len, sm_scale
+):
+    batch_size, num_candidates = candidate_q.shape[:2]
+    row_starts = jnp.arange(batch_size + 1, dtype=jnp.int32)
+    output = ranker_attention_varlen_candidate_only_fa4(
+        *(jax.lax.collapse(x, 0, 2) for x in (candidate_q, history_k, history_v, own_k, own_v)),
+        row_starts * num_candidates,
+        row_starts * history_k.shape[1],
+        hist_valid_len,
+        sm_scale,
+    )
+    return output.reshape(candidate_q.shape)

@@ -1,12 +1,7 @@
-use std::cell::Cell;
-use std::time::Instant;
-
 use xai_stats_receiver::{global_stats_receiver, HistogramBuckets};
 
 use super::types::{FailureKind, FallbackReason, LabelSource};
 
-const REQUESTS: &str = "safety_labels_lookup_requests";
-const LATENCY_MS: &str = "safety_labels_lookup_latency_ms_vm";
 const LOOKUP_TWEET_IDS: &str = "safety_labels_lookup_tweet_ids";
 const FAILURES: &str = "safety_labels_lookup_failures";
 const SOURCE_REQUESTS: &str = "safety_labels_source_requests";
@@ -16,15 +11,6 @@ const MANHATTAN_KEYS: &str = "safety_labels_manhattan_keys";
 const CACHE_FALLBACK_KEYS: &str = "safety_labels_cache_fallback_keys";
 const BATCH_SIZE: &str = "safety_labels_lookup_batch_size";
 const CACHE_WARM_KEYS: &str = "safety_labels_cache_warm_keys";
-
-#[derive(Clone, Copy, strum::IntoStaticStr)]
-#[strum(serialize_all = "snake_case")]
-pub(crate) enum RequestOutcome {
-    Started,
-    Cancelled,
-    Success,
-    Failure,
-}
 
 #[derive(Clone, Copy, strum::IntoStaticStr)]
 #[strum(serialize_all = "snake_case")]
@@ -62,37 +48,6 @@ pub(crate) enum BatchStage {
     Request,
     LocalMiss,
     ManhattanFallback,
-}
-
-pub(crate) struct RequestMetricsGuard {
-    start: Instant,
-    outcome: Cell<RequestOutcome>,
-}
-
-impl RequestMetricsGuard {
-    pub(crate) fn new() -> Self {
-        incr(REQUESTS, &[("outcome", RequestOutcome::Started.into())], 1);
-        Self {
-            start: Instant::now(),
-            outcome: Cell::new(RequestOutcome::Cancelled),
-        }
-    }
-
-    pub(crate) fn mark_success(&self) {
-        self.outcome.set(RequestOutcome::Success);
-    }
-
-    pub(crate) fn mark_failure(&self) {
-        self.outcome.set(RequestOutcome::Failure);
-    }
-}
-
-impl Drop for RequestMetricsGuard {
-    fn drop(&mut self) {
-        let outcome = <&str>::from(self.outcome.get());
-        incr(REQUESTS, &[("outcome", outcome)], 1);
-        observe_vm(LATENCY_MS, &[], self.start.elapsed().as_secs_f64() * 1000.0);
-    }
 }
 
 pub(crate) fn record_lookup_tweet_ids(success: usize, failed: usize) {
@@ -193,8 +148,6 @@ mod tests {
         BATCH_LATENCY_VM_METRIC, LATENCY_VM_METRIC,
     };
 
-    use super::LATENCY_MS;
-
     #[test]
     fn dashboard_generator_pins_the_get_safety_labels_vm_latency_metrics() {
         let cargo = concat!(env!("CARGO_MANIFEST_DIR"), "/scripts/dashboard.py");
@@ -202,7 +155,6 @@ mod tests {
         let path = if Path::new(cargo).exists() { cargo } else { ws };
         let dashboard = fs::read_to_string(path).unwrap_or_else(|e| panic!("read {path}: {e}"));
         for pin in [
-            format!("LOOKUP_LATENCY_VM_METRIC = \"{LATENCY_MS}\""),
             format!("VF_CLIENT_LATENCY_VM_METRIC = \"{LATENCY_VM_METRIC}\""),
             format!("VF_CLIENT_BATCH_LATENCY_VM_METRIC = \"{BATCH_LATENCY_VM_METRIC}\""),
         ] {

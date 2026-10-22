@@ -14,6 +14,7 @@ import os
 import pathlib
 import shutil
 import signal
+import subprocess
 import sys
 import time
 import typing
@@ -56,6 +57,7 @@ else:
 
     AsyncEmbContextHandle = typing.Any
 
+from xrex.data.recsys.array_allocator import ArrayAllocator
 from xrex.data.recsys.recsys_batch import RecsysFeaturesBatch
 from xrex.data.recsys.sequence_packing import (
     PACK_BLOCK_SIZE,
@@ -80,14 +82,15 @@ from xrex.models.recsys_embedding import (
     get_recsys_embed_param_to_jax_array,
 )
 from xrex.models.recsys_model import (
-    CandidateInputs,
     RecsysAggregatedModel,
     RecsysAggregatedModelConfig,
 )
+from xrex.models.recsys_two_tower_model import RecsysTwoTowerModel
 from xrex.models.sharding_context import make_legacy_sharding_context
-from xrex.optimizers.optim import InjectHyperparamsState, apply_updates
+from xrex.optimizers.optim import InjectHyperparamsState, apply_updates, partition_grad_norms
 from xrex.optimizers.recsys import RecsysEmbeddingOptimConfig
 from xrex.optimizers.recsys.protocol import AsyncEmbOptimizer
+from xrex.train import retrieval_corpus_stager as corpus_stager
 from xrex.train.misc import (
     CheckpointConfig,
     PostEmbeddings,
@@ -101,6 +104,7 @@ from xrex.train.trainer import (
 from xrex.utils import recsys_async_emb
 from xrex.utils.aot import JittedOrCompiled
 from xrex.utils.checkpointing import wait_until_finished
+from xrex.utils.gpu import peak_tflops
 from xrex.utils.metrics import norm_metrics
 from xrex.utils.utils import (
     cast_bfloat16,
@@ -114,6 +118,8 @@ OUT_PATH = "/dev/shm"
 
 _DATA_POSITION_FILENAME = "data_position.json"
 _CONFIG_FILENAME = "config.json"
+_FORWARD_ONLY_PROGRESS_FILENAME = "forward_only_progress.json"
+_FORWARD_ONLY_PROGRESS_EVERY_S = 60.0
 
 
 @dataclass(frozen=True)
@@ -211,6 +217,92 @@ def _pad_vocab_for_ep(emb: jax.Array, ep: int, name: str = "emb_table") -> jax.A
     return jnp.pad(emb, ((0, target_V - V),) + ((0, 0),) * (emb.ndim - 1))
 
 
+@functools.partial(jax.jit, donate_argnums=(0,))
+def _write_rows_in_place(buffer: jax.Array, rows: jax.Array, offset: jax.Array) -> jax.Array:
+    return jax.lax.dynamic_update_slice_in_dim(buffer, rows, offset, axis=0)
+
+
+def _int64_as_int32_pairs(values: np.ndarray) -> np.ndarray:
+    values = np.ascontiguousarray(values, dtype=np.int64)
+    if sys.byteorder == "little":
+        return values.view(np.int32).reshape(-1, 2)
+    return np.stack(
+        [(values & 0xFFFFFFFF).astype(np.int32), (values >> 32).astype(np.int32)], axis=1
+    )
+
+
+def _chunked_row_forward_on_device(
+    sharding: jax.sharding.Sharding,
+    host_inputs: typing.Sequence[np.ndarray],
+    run_chunk: typing.Callable[..., jax.Array],
+    max_chunk_rows: int,
+    max_chunks_in_flight: int = 2,
+) -> jax.Array | None:
+    if not host_inputs:
+        raise ValueError("host_inputs must be nonempty")
+    if max_chunk_rows <= 0 or max_chunks_in_flight <= 0:
+        raise ValueError("chunk size and in-flight limit must be positive")
+    num_rows = host_inputs[0].shape[0]
+    if any(x.shape[0] != num_rows for x in host_inputs):
+        raise ValueError("host_inputs must share the leading dimension")
+    num_local = len(sharding.addressable_devices)
+    if num_rows == 0 or num_rows % num_local != 0:
+        return None
+    rows_per_device = num_rows // num_local
+    if num_local > 1:
+        probe_shape = (rows_per_device * len(sharding.device_set), *host_inputs[0].shape[1:])
+        try:
+            index_map = sharding.addressable_devices_indices_map(probe_shape)
+        except (IndexError, ValueError):
+            return None
+        if len({idx[0].start or 0 for idx in index_map.values()}) != num_local:
+            return None
+    chunk_rows = max(1, min(rows_per_device, max_chunk_rows // num_local))
+
+    buffers: list[jax.Array] = []
+    in_flight: collections.deque[jax.Array] = collections.deque()
+    global_rows = 0
+    out_trailing: tuple[int, ...] = ()
+    out_sharding = None
+    for start in range(0, rows_per_device, chunk_rows):
+        end = min(start + chunk_rows, rows_per_device)
+        chunk_inputs = []
+        for x in host_inputs:
+            if num_local == 1:
+                local = x[start:end]
+            else:
+                local = np.concatenate(
+                    [
+                        x[d * rows_per_device + start : d * rows_per_device + end]
+                        for d in range(num_local)
+                    ],
+                    axis=0,
+                )
+            chunk_inputs.append(jax.make_array_from_process_local_data(sharding, local))
+        out = run_chunk(*chunk_inputs)
+        shards = sorted(out.addressable_shards, key=lambda s: s.index[0].start or 0)
+        if not buffers:
+            buffers = [
+                jnp.zeros((rows_per_device, *s.data.shape[1:]), s.data.dtype, device=s.device)
+                for s in shards
+            ]
+        offset = np.int32(start)
+        for d, shard in enumerate(shards):
+            buffers[d] = _write_rows_in_place(buffers[d], shard.data, offset)
+        global_rows += out.shape[0]
+        out_trailing = out.shape[1:]
+        out_sharding = out.sharding
+        in_flight.append(out)
+        if len(in_flight) > max_chunks_in_flight:
+            jax.block_until_ready(in_flight.popleft())
+        del out, shards
+
+    assert out_sharding is not None
+    return jax.make_array_from_single_device_arrays(
+        (global_rows, *out_trailing), out_sharding, buffers
+    )
+
+
 def _write_all_bytes(path: str, mv: memoryview, chunk_size: int = 1 << 30) -> None:
     if chunk_size <= 0:
         raise ValueError(f"chunk_size must be positive, got {chunk_size}")
@@ -286,16 +378,22 @@ class RecsysTrainer(Trainer):
     reset_data_position: bool = False
 
     seqpack_distribution: LengthDistribution | None = None
+    min_packed_history_len: int | None = None
 
+    seqpack_empty_history_min_slot: bool = False
     seqpack_fixed_length: bool = False
-    seqpack_drop_empty_candidates: bool = False
-    seqpack_candidate_tokens_per_user: list[int] = field(default_factory=lambda: [32, 128])
+    seqpack_candidate_packing: bool = False
+    seqpack_candidate_count: list[int] = field(default_factory=list)
 
     use_async_emb: bool = False
 
     use_row_emb: bool = False
     row_emb_recv_factor: float = 2.0
     num_microbatch: int = 1
+
+    forward_only: bool = False
+    _forward_only_first_metrics_s: float | None = field(default=None, init=False, repr=False)
+    _forward_only_progress_written_s: float | None = field(default=None, init=False, repr=False)
 
     _async_emb_context: AsyncEmbContextHandle | None = field(default=None, init=False, repr=False)
     _emb_hash_vocab: int = field(default=0, init=False, repr=False)
@@ -310,6 +408,7 @@ class RecsysTrainer(Trainer):
         default_factory=BatchPipelineState, init=False, repr=False
     )
 
+    _alloc: ArrayAllocator = field(default_factory=ArrayAllocator, init=False, repr=False)
     _data_position: DataPosition | None = field(default=None, init=False, repr=False)
     _seqpack_rng: np.random.Generator | None = field(default=None, init=False, repr=False)
     _history_user_dropout_rng: np.random.Generator | None = field(
@@ -318,6 +417,16 @@ class RecsysTrainer(Trainer):
     _last_history_user_dropout_count: int = field(default=0, init=False, repr=False)
     _last_history_user_dropout_bsz: int = field(default=0, init=False, repr=False)
     _retrieval_post_emb_built: bool = field(default=False, init=False, repr=False)
+    retrieval_staged_corpus: bool = False
+    retrieval_staged_corpus_dir: str = "/dev/shm/retrieval_corpus"
+    retrieval_staged_corpus_poll_seconds: float = 30.0
+    retrieval_post_table_chunk_rows: int = 65536
+    _retrieval_corpus_stager_proc: subprocess.Popen | None = field(
+        default=None, init=False, repr=False
+    )
+    _post_table_ids_generation: int | None = field(default=None, init=False, repr=False)
+    _post_table_lookup_jit: typing.Any = field(default=None, init=False, repr=False)
+    _eval_lookup_jit: typing.Any = field(default=None, init=False, repr=False)
     dense_params_ema_decay: float = 0.0
     dense_params_ema_in_checkpoint: bool = False
     _dense_params_ema: typing.Any = field(default=None, init=False, repr=False)
@@ -327,12 +436,23 @@ class RecsysTrainer(Trainer):
     _dense_params_ema_as_params_jit: typing.Any = field(default=None, init=False, repr=False)
 
     def __post_init__(self):
+        if self.retrieval_post_table_chunk_rows <= 0:
+            raise ValueError("retrieval_post_table_chunk_rows must be positive")
+        if self.retrieval_staged_corpus_poll_seconds <= 0:
+            raise ValueError("retrieval_staged_corpus_poll_seconds must be positive")
         if self.using_seqpack and self.seqpack_fixed_length:
             assert isinstance(self.model_config, RecsysAggregatedModelConfig)
             hl = self.model_config.history_seq_len
             self.seqpack_distribution = FixedLengthDistribution(min_len=hl, max_len=hl, mean_len=hl)
         if self.export_stablehlo_bundle and not self.checkpoint_config.copy_port:
             raise ValueError("export_stablehlo_bundle requires checkpoint_config.copy_port")
+        if self.forward_only and (
+            self.use_async_emb or self.use_row_emb or self.num_microbatch > 1
+        ):
+            raise ValueError(
+                "forward_only runs the synchronous step: set use_async_emb=False, "
+                "use_row_emb=False and num_microbatch=1"
+            )
 
     state: RecsysTrainingState = field(init=False, repr=False, compare=False)
     _pending_shmem_ckpt_write_s: float | None = field(default=None, init=False, repr=False)
@@ -394,7 +514,14 @@ class RecsysTrainer(Trainer):
     ) -> RecsysFeaturesBatch:
         if self.using_seqpack:
             batch = self._pack_batch(batch, self._seqpack_rng, candidate_tokens_per_user)
-        return batch
+
+        def narrow_to_32bit(x):
+            if not isinstance(x, np.ndarray):
+                return x
+            dtype = jax.dtypes.canonicalize_dtype(x.dtype)
+            return x if dtype == x.dtype else self._alloc.copy(x, dtype)
+
+        return jax.tree.map(narrow_to_32bit, batch)
 
     def _total_candidate_seq_len(self) -> int:
         assert isinstance(self.dataset, PhoenixDataset)
@@ -408,15 +535,11 @@ class RecsysTrainer(Trainer):
     def _history_mean_len(self, candidate_tokens_per_user: int) -> int:
         assert self.seqpack_distribution is not None
         return self.seqpack_distribution.mean_len - (
-            candidate_tokens_per_user - self.seqpack_candidate_tokens_per_user[0]
+            candidate_tokens_per_user - self.seqpack_candidate_count[0]
         )
 
-    @property
-    def _candidate_region_sizes(self) -> list[int]:
-        return self.seqpack_candidate_tokens_per_user if self.seqpack_drop_empty_candidates else []
-
     def _history_lookup_len(self, hashes_per_token: int) -> int | None:
-        if not self.seqpack_drop_empty_candidates:
+        if not self.seqpack_candidate_packing:
             return None
         assert self.seqpack_distribution is not None
         return self.seqpack_distribution.mean_len * hashes_per_token
@@ -426,9 +549,10 @@ class RecsysTrainer(Trainer):
     ) -> int | None:
         from jax._src.distributed import global_state as jax_distributed
 
-        sizes = self._candidate_region_sizes
-        if len(sizes) < 2:
-            return sizes[0] if sizes else None
+        if not self.seqpack_candidate_packing:
+            return None
+        if len(self.seqpack_candidate_count) == 1:
+            return self.seqpack_candidate_count[0]
         num_devices = self.parallel_config.num_devices_per_process
         needed = max(candidate_tokens_per_user_needed(b, num_devices) for b in microbatches)
         needed = max_over_processes(
@@ -439,7 +563,10 @@ class RecsysTrainer(Trainer):
             _CANDIDATE_SIZE_AGREEMENT_TIMEOUT_MS,
         )
         self._candidate_size_round += 1
-        return next((size for size in sizes if size >= needed), sizes[-1])
+        return next(
+            (size for size in self.seqpack_candidate_count if size >= needed),
+            self.seqpack_candidate_count[-1],
+        )
 
     def _pack_batch(
         self,
@@ -451,10 +578,8 @@ class RecsysTrainer(Trainer):
             self.model_config, (RecsysAggregatedModelConfig, RecsysTwoTowerModelConfig)
         )
         dist = self.seqpack_distribution
-        if self.seqpack_drop_empty_candidates:
-            candidate_tokens_per_user = (
-                candidate_tokens_per_user or self.seqpack_candidate_tokens_per_user[0]
-            )
+        if self.seqpack_candidate_packing:
+            candidate_tokens_per_user = candidate_tokens_per_user or self.seqpack_candidate_count[0]
             assert dist is not None
             dist = replace(dist, mean_len=self._history_mean_len(candidate_tokens_per_user))
         batch = pack_batch(
@@ -463,7 +588,10 @@ class RecsysTrainer(Trainer):
             num_user_prefix_tokens=self.model_config.num_user_prefix_tokens,
             dist=dist,
             rng=rng,
+            min_packed_history_len=self.min_packed_history_len if dist is not None else None,
             candidate_tokens_per_user=candidate_tokens_per_user,
+            empty_history_min_slot=self.seqpack_empty_history_min_slot,
+            alloc=self._alloc,
         )
         if self.using_fa4:
             batch = self.add_block_sparse_layout(batch)
@@ -538,7 +666,9 @@ class RecsysTrainer(Trainer):
             dataset_types=jnp.array([RetrievalDataset.PAD.value], dtype=jnp.int32),
         )
         if isinstance(self.model_config, RecsysTwoTowerModelConfig):
-            post_embeddings = self.model_config.candidate_tower_config.make_post_embeddings()
+            post_embeddings = self.model_config.candidate_tower_config.make_post_embeddings(
+                self.model_config.num_table_slots
+            )
             side_width = self.model_config.mol_side_table_width
             if side_width:
                 emb = post_embeddings.embeddings
@@ -949,6 +1079,16 @@ class RecsysTrainer(Trainer):
     ) -> dict[str, float | int]:
         metrics = super().handle_metrics(soft_step, metrics)
 
+        if self.forward_only:
+            assert isinstance(
+                self.model_config, (RecsysAggregatedModelConfig, RecsysTwoTowerModelConfig)
+            )
+            num_seq_per_sec_per_device = (
+                self.batch_size / float(metrics["step_time"]) / self.num_devices
+            )
+            metrics["tflops"] = self.model_config.compute_forward_tflops(num_seq_per_sec_per_device)
+            metrics["mfu"] = metrics["tflops"] / peak_tflops()
+
         if self.empty_history_user_dropout_rate > 0.0 and self._last_history_user_dropout_bsz > 0:
             metrics["train/empty_history_user_dropout_frac"] = (
                 self._last_history_user_dropout_count / self._last_history_user_dropout_bsz
@@ -962,7 +1102,71 @@ class RecsysTrainer(Trainer):
                 metrics_dict=metrics,
             )
 
+        if self.forward_only:
+            self._maybe_write_forward_only_progress(int(metrics["step"]))
+
         return metrics
+
+    def forward_only_progress_path(self) -> str:
+        from xrex.utils.metadata import checkpoint_dir_or_default
+
+        ckpt_dir = checkpoint_dir_or_default(self.checkpoint_config.checkpoint_dir)
+        return os.path.join(ckpt_dir, self.name, _FORWARD_ONLY_PROGRESS_FILENAME)
+
+    def _maybe_write_forward_only_progress(self, step: int) -> None:
+        now = time.monotonic()
+        if self._forward_only_first_metrics_s is None:
+            self._forward_only_first_metrics_s = now
+            return
+        last = self._forward_only_progress_written_s or self._forward_only_first_metrics_s
+        if now - last < _FORWARD_ONLY_PROGRESS_EVERY_S:
+            return
+        path = self.forward_only_progress_path()
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        tmp_path = f"{path}.tmp"
+        with open(tmp_path, "w") as f:
+            json.dump(
+                {
+                    "step": step,
+                    "elapsed_samples": self.elapsed_samples,
+                    "updated_at_unix": time.time(),
+                },
+                f,
+            )
+        os.replace(tmp_path, path)
+        self._forward_only_progress_written_s = now
+
+    def _resume_forward_only(self, res: tuple[bool, int, int]) -> tuple[bool, int, int]:
+        path = self.forward_only_progress_path()
+        buf = np.zeros(1024, dtype=np.uint8)
+        if jax.process_index() == 0 and os.path.isfile(path):
+            with open(path, "rb") as f:
+                raw = f.read()
+            buf[: len(raw)] = list(raw)
+        buf = multihost_utils.broadcast_one_to_all(buf)
+        raw_progress = bytes(np.asarray(buf, dtype=np.uint8)).rstrip(b"\x00").decode("utf-8")
+        if not raw_progress:
+            return res
+        progress = json.loads(raw_progress)
+
+        if isinstance(self.dataset, PhoenixKafkaDataset):
+            self.dataset.seek_to_offset = None
+        assert isinstance(self.state, RecsysTrainingState)
+        rce_ema = self.state.rce_ema
+        calib_ema = self.state.calib_ema
+        self.state = self.state._replace(
+            step=jnp.array(int(progress["step"]) + 1),
+            rce_ema=None if rce_ema is None else jax.tree.map(jnp.zeros_like, rce_ema),
+            calib_ema=None if calib_ema is None else jax.tree.map(jnp.zeros_like, calib_ema),
+        )
+        rank_logger.info(
+            "forward_only restart: resuming from the consumer group's committed offsets "
+            "at step=%s elapsed_samples=%s (%s)",
+            progress["step"],
+            progress["elapsed_samples"],
+            path,
+        )
+        return res[0], int(progress["elapsed_samples"]), res[2]
 
     def create_dataset(self, ctx: TrainerContext):
         assert isinstance(self.dataset, PhoenixDataset)
@@ -1326,6 +1530,8 @@ class RecsysTrainer(Trainer):
             "b1": new_opt_state.hyperparams["b1"],
             "b2": new_opt_state.hyperparams["b2"],
         }
+        if self.optim_config.clip_partitions:
+            metrics.update(partition_grad_norms(gradients, self.optim_config.clip_partitions))
         if self.track_norm_metrics:
             metrics.update(norm_metrics(new_params, new_opt_state, gradients, updates))
 
@@ -1374,6 +1580,69 @@ class RecsysTrainer(Trainer):
 
         return new_state, metrics, {}
 
+    def forward_only_step(
+        self,
+        state: RecsysTrainingState,
+        data: RecsysFeaturesBatch,
+        lr: float,
+    ):
+        del lr
+        assert state.emb_table is not None
+        assert isinstance(
+            self.model_config, (RecsysAggregatedModelConfig, RecsysTwoTowerModelConfig)
+        )
+
+        token_ids = self.get_flattened_token_ids(data)
+        rng, new_rng = jax.random.split(state.rng)
+
+        fprop_params = state.params
+        if self.precision_level < 3:
+            fprop_params = jax.tree.map(cast_bfloat16, state.params)
+
+        recsys_embeddings = self.get_recsys_embeddings(data, state.emb_table)
+        recsys_embeddings, _ = self._emb_optim.transform_embeddings(
+            recsys_embeddings, token_ids, state.emb_table_state
+        )
+
+        rce_alpha = None
+        if state.rce_ema is not None and self.smoothing_windows:
+            rce_alpha = jnp.array(
+                [min(1.0, self.batch_size / w) for w in self.smoothing_windows],
+                dtype=jnp.float32,
+            )
+
+        loss, stats = self.loss_fn.apply(
+            fprop_params, rng, data, recsys_embeddings, state.rce_ema, rce_alpha, state.calib_ema
+        )
+        new_rce_ema = stats.pop("_rce_ema", state.rce_ema)
+        new_calib_ema = stats.pop("_calib_ema", state.calib_ema)
+
+        valid_step = jnp.array(True)
+        examples = np.prod(data["user_hashes"].shape[:-1])
+        metrics = {
+            "step": state.step,
+            "loss": loss,
+            "examples_per_batch": examples,
+            "valid_step": valid_step,
+        }
+        metrics.update(**stats)
+        metrics["offset_zero_values"] = jnp.sum(state.offset_values == 0)
+        metrics = jax.tree.map(lambda x: x.astype(jnp.float32), metrics)
+
+        metric_keys, metric_values = zip(*metrics.items())
+        packed_metrics = {
+            metric_keys: jnp.stack([jnp.float32(v) for v in metric_values], axis=0),
+            ("valid_step",): valid_step,
+        }
+
+        new_state = state._replace(
+            rng=new_rng,
+            step=state.step + 1,
+            rce_ema=new_rce_ema,
+            calib_ema=new_calib_ema,
+        )
+        return new_state, packed_metrics, {}
+
     def _run_microbatches(
         self,
         microbatch_loss_fn: typing.Callable[..., typing.Any],
@@ -1381,8 +1650,9 @@ class RecsysTrainer(Trainer):
         batches: RecsysFeaturesBatch,
         embeddings: RecsysEmbeddingsParameter,
         rngs: jax.Array,
-        candidate_inputs: CandidateInputs,
+        candidate_inputs: typing.Any,
         loss_normalizers: dict[str, jax.Array],
+        step_fn: typing.Callable[..., typing.Any] | None = None,
     ):
         ctx = self._async_emb_context
         assert ctx is not None
@@ -1399,33 +1669,71 @@ class RecsysTrainer(Trainer):
             check_vma=False,
         )
         def run(params, batches, embeddings, rngs, candidate_inputs, loss_normalizers):
-            def body(gradients, loss_normalizers, rng, batch, embeddings, candidate_inputs):
-                rng = jax.random.fold_in(rng, jax.lax.axis_index(ctx.data_axis))
-                (loss_k, (stats, metric_inputs)), (gradients_k, emb_gradients) = jax.value_and_grad(
-                    functools.partial(microbatch_loss_fn, loss_normalizers=loss_normalizers),
-                    argnums=(0, 3),
-                    has_aux=True,
-                )(params, rng, batch, embeddings, candidate_inputs=candidate_inputs)
-                gradients = jax.tree.map(
-                    lambda a, g: a + g.astype(jnp.float32), gradients, gradients_k
+            step_kwargs: dict[str, typing.Any] = {}
+            pool, pool_vjp = None, None
+            if step_fn is not None:
+                pool, pool_vjp = jax.vjp(
+                    lambda params, embeddings: step_fn(params, None, batches, embeddings),
+                    params,
+                    embeddings,
                 )
-                return gradients, (loss_k, stats, emb_gradients, metric_inputs)
+                step_kwargs["step_inputs"] = candidate_inputs
+
+            def loss(params, rng, batch, embeddings, candidate_inputs, pool):
+                return microbatch_loss_fn(
+                    params,
+                    rng,
+                    batch,
+                    embeddings,
+                    candidate_inputs=candidate_inputs,
+                    loss_normalizers=loss_normalizers,
+                    **step_kwargs,
+                    **({} if pool is None else {"candidate_pool": pool}),
+                )
+
+            def accumulate(sums, terms):
+                return jax.tree.map(lambda a, g: a + g.astype(jnp.float32), sums, terms)
+
+            def body(gradients, pool_gradients, rng, batch, embeddings, candidate_inputs):
+                rng = jax.random.fold_in(rng, jax.lax.axis_index(ctx.data_axis))
+                argnums = (0, 3) if pool is None else (0, 3, 5)
+                (
+                    (loss_k, (stats, metric_inputs)),
+                    (gradients_k, emb_gradients, *pool_gradients_k),
+                ) = jax.value_and_grad(loss, argnums=argnums, has_aux=True)(
+                    params, rng, batch, embeddings, candidate_inputs, pool
+                )
+                gradients = accumulate(gradients, gradients_k)
+                if pool is not None:
+                    pool_gradients = accumulate(pool_gradients, pool_gradients_k[0])
+                return gradients, pool_gradients, (loss_k, stats, emb_gradients, metric_inputs)
 
             inputs = (rngs, batches, embeddings, candidate_inputs)
             inputs, loss_normalizers = jax.lax.optimization_barrier((inputs, loss_normalizers))
             gradients = jax.tree.map(lambda p: jnp.zeros(p.shape, jnp.float32), params)
+            pool_gradients = (
+                None
+                if pool is None
+                else jax.tree.map(lambda x: jnp.zeros(x.shape, jnp.float32), pool)
+            )
             outputs = []
             for k in range(rngs.shape[0]):
                 if k > 0:
-                    inputs, gradients, outputs[-1] = jax.lax.optimization_barrier(
-                        (inputs, gradients, outputs[-1])
+                    inputs, gradients, pool_gradients, outputs[-1] = jax.lax.optimization_barrier(
+                        (inputs, gradients, pool_gradients, outputs[-1])
                     )
                 microbatch = jax.tree.map(operator.itemgetter(k), inputs)
-                gradients, output = body(gradients, loss_normalizers, *microbatch)
+                gradients, pool_gradients, output = body(gradients, pool_gradients, *microbatch)
                 outputs.append(output)
             losses, stats, emb_gradients, metric_inputs = jax.tree.map(
                 lambda *xs: jnp.stack(xs), *outputs
             )
+            if pool_vjp is not None:
+                pool_param_gradients, pool_emb_gradients = pool_vjp(
+                    jax.tree.map(lambda g, x: g.astype(x.dtype), pool_gradients, pool)
+                )
+                gradients = accumulate(gradients, pool_param_gradients)
+                emb_gradients = jax.tree.map(jnp.add, emb_gradients, pool_emb_gradients)
             gradients = jax.tree.map(lambda g, p: g.astype(p.dtype), gradients, params)
             loss_sum, stats = jax.tree.map(lambda x: x.sum(0), (losses, stats))
             joined = jax.tree.map(
@@ -1489,7 +1797,14 @@ class RecsysTrainer(Trainer):
         gate = prefetched_embeddings[0, :, 0, :1]
 
         if self.num_microbatch > 1:
-            loss_inputs_fn, microbatch_loss_fn, metrics_fn = self.microbatch_loss_fns.apply
+            two_tower = isinstance(self.model_config, RecsysTwoTowerModelConfig)
+            step_fn = None
+            if two_tower:
+                loss_inputs_fn, step_fn, microbatch_loss_fn, metrics_fn = (
+                    self.microbatch_loss_fns.apply
+                )
+            else:
+                loss_inputs_fn, microbatch_loss_fn, metrics_fn = self.microbatch_loss_fns.apply
             data_shards = math.prod(self.mesh.shape[a] for a in ctx.data_axis)
             candidate_inputs, loss_normalizers = loss_inputs_fn(
                 {}, None, data, self.num_microbatch * data_shards
@@ -1498,6 +1813,8 @@ class RecsysTrainer(Trainer):
             gate = recsys_async_emb.depend(
                 ctx, gate, jnp.stack(jax.tree.leaves(loss_normalizers)).sum(), on_sharded=False
             )
+            if two_tower and candidate_inputs.pool.tweet_counts is not None:
+                gate = recsys_async_emb.depend(ctx, gate, candidate_inputs.pool.tweet_counts[0])
 
         update_start_pin, updating_table, updating_emb_state, emb_optim_metrics = (
             self._emb_optim.gradient_update_start(
@@ -1576,6 +1893,7 @@ class RecsysTrainer(Trainer):
                 jax.random.split(rng, self.num_microbatch),
                 candidate_inputs,
                 loss_normalizers,
+                step_fn=step_fn,
             )
             if not self.use_row_emb:
                 token_ids, gradients = jax.lax.optimization_barrier((token_ids, gradients))
@@ -1591,17 +1909,20 @@ class RecsysTrainer(Trainer):
             updated_emb_state, grad_update_done_pin = jax.lax.optimization_barrier(
                 (updated_emb_state, grad_update_done_pin)
             )
-            stats = metrics_fn(
-                {},
-                None,
-                metric_inputs,
-                batch,
-                stats,
-                state.rce_ema,
-                rce_alpha,
-                tuple(self.smoothing_windows) if state.rce_ema is not None else None,
-                state.calib_ema,
-            )
+            if two_tower:
+                stats = metrics_fn({}, None, metric_inputs, batch, stats)
+            else:
+                stats = metrics_fn(
+                    {},
+                    None,
+                    metric_inputs,
+                    batch,
+                    stats,
+                    state.rce_ema,
+                    rce_alpha,
+                    tuple(self.smoothing_windows) if state.rce_ema is not None else None,
+                    state.calib_ema,
+                )
         emb_valid_step = emb_valid_step | ~emb_update_pending
         if self.precision_level >= 2:
             gradients = jax.tree.map(lambda x: x.astype(jnp.float32), gradients)
@@ -1637,6 +1958,8 @@ class RecsysTrainer(Trainer):
             "deferred_emb_grad_norm": deferred_emb_grad_norm,
             "deferred_emb_valid_step": deferred_emb_valid_step,
         }
+        if self.optim_config.clip_partitions:
+            metrics.update(partition_grad_norms(gradients, self.optim_config.clip_partitions))
         metrics.update(emb_optim_metrics)
         if self.track_norm_metrics:
             metrics.update(norm_metrics(new_params, new_opt_state, gradients, updates))
@@ -1644,7 +1967,7 @@ class RecsysTrainer(Trainer):
         new_rce_ema = stats.pop("_rce_ema", state.rce_ema)
         new_calib_ema = stats.pop("_calib_ema", state.calib_ema)
         metrics.update(**stats)
-        if self.seqpack_drop_empty_candidates:
+        if self.seqpack_candidate_packing:
             metrics.update(self._candidate_region_metrics(data, grad_update_done_pin))
         metrics["offset_zero_values"] = jnp.sum(state.offset_values == 0)
         metrics = jax.tree.map(lambda x: x.astype(jnp.float32), metrics)
@@ -1689,7 +2012,7 @@ class RecsysTrainer(Trainer):
         assert self._batch_pipeline.reserve is not None
         try:
             if self._async_emb_lookup_pin is None:
-                if len(self._candidate_region_sizes) > 1:
+                if self.seqpack_candidate_packing and len(self.seqpack_candidate_count) > 1:
                     self._reserve_small_buffer_region()
                 state, self._async_emb_lookup_pin = self._first_step_embedding_lookup_start_jit(
                     state, self._lookup_hash_fields(data)
@@ -1777,7 +2100,7 @@ class RecsysTrainer(Trainer):
         }
 
     def _candidate_region_len(self, data: tuple[RecsysFeaturesBatch, ...]) -> int:
-        if not self.seqpack_drop_empty_candidates:
+        if not self.seqpack_candidate_packing:
             return 0
         layout = data[0]["packing_layout"]
         assert layout is not None and layout.candidate_token_to_slot is not None
@@ -1958,10 +2281,10 @@ class RecsysTrainer(Trainer):
             compiler_options=compiler_options,
         )
 
-        sizes = self._candidate_region_sizes
+        sizes = self.seqpack_candidate_count if self.seqpack_candidate_packing else []
         if sizes and sizes[-1] <= self._total_candidate_seq_len():
             rank_logger.warning(
-                "seqpack_candidate_tokens_per_user ends at %d, not above the %d candidate slots, so "
+                "seqpack_candidate_count ends at %d, not above the %d candidate slots, so "
                 "batches whose users fill nearly every slot drop candidates "
                 "(train/seqpack_dropped_candidate_slots)",
                 sizes[-1],
@@ -2025,41 +2348,64 @@ class RecsysTrainer(Trainer):
         if self.num_microbatch > 1:
             if not self.use_async_emb:
                 raise ValueError("num_microbatch > 1 requires use_async_emb=True")
-            if type(self.model_config) is not RecsysAggregatedModelConfig:
-                raise ValueError("num_microbatch > 1 supports only the ranker")
+            if isinstance(self.model_config, RecsysTwoTowerModelConfig):
+                if self.model_config.apply_u2u_and_i2i_loss:
+                    raise ValueError("num_microbatch > 1 does not support apply_u2u_and_i2i_loss")
+            elif type(self.model_config) is not RecsysAggregatedModelConfig:
+                raise ValueError("num_microbatch > 1 supports only the ranker and the two-tower")
             if self.empty_history_augmentation_rate > 0:
                 raise ValueError(
                     "num_microbatch > 1 does not support empty_history_augmentation_rate"
                 )
-        if self.seqpack_drop_empty_candidates:
-            sizes = self.seqpack_candidate_tokens_per_user
-            if not (isinstance(self.model_config, RecsysAggregatedModelConfig) and self.using_fa4):
+        if self.seqpack_candidate_packing:
+            if not isinstance(self.model_config, RecsysAggregatedModelConfig):
+                raise ValueError("seqpack_candidate_packing supports only the ranker")
+            if not self.using_seqpack:
+                raise ValueError("seqpack_candidate_packing requires use_seqpack=True")
+            if not self.using_fa4:
                 raise ValueError(
-                    "seqpack_drop_empty_candidates needs a seqpack ranker on "
-                    "cutedsl_ranker_varlen_attn"
+                    "seqpack_candidate_packing requires attn_impl=cutedsl_ranker_varlen_attn"
                 )
+            attn_config = self.model_config.model_config.attn_config
+            assert attn_config is not None
+            if attn_config.attn_logit_cap > 0 and attn_config.attn_logit_cap_method != "none":
+                raise ValueError("seqpack_candidate_packing does not support attn_logit_cap")
             if self.seqpack_distribution is None:
-                raise ValueError("seqpack_drop_empty_candidates needs seqpack_distribution")
-            if not sizes or list(sizes) != sorted(set(sizes)):
+                raise ValueError("seqpack_candidate_packing requires seqpack_distribution")
+            if not self.seqpack_candidate_count:
+                raise ValueError("seqpack_candidate_packing requires seqpack_candidate_count")
+            if list(self.seqpack_candidate_count) != sorted(set(self.seqpack_candidate_count)):
                 raise ValueError(
-                    f"seqpack_candidate_tokens_per_user must be ascending and unique: {sizes}"
+                    "seqpack_candidate_count must be ascending and unique: "
+                    f"{self.seqpack_candidate_count}"
                 )
             if not self.use_async_emb:
-                raise ValueError("seqpack_drop_empty_candidates needs use_async_emb=True")
+                raise ValueError("seqpack_candidate_packing requires use_async_emb=True")
             users_per_microbatch = int(self.bs_per_device) // self.num_microbatch
-            if any(users_per_microbatch * size % PACK_BLOCK_SIZE for size in sizes):
+            if any(
+                users_per_microbatch * size % PACK_BLOCK_SIZE
+                for size in self.seqpack_candidate_count
+            ):
                 raise ValueError(
-                    f"every seqpack_candidate_tokens_per_user times the {users_per_microbatch} "
+                    f"every seqpack_candidate_count times the {users_per_microbatch} "
                     f"users per device and microbatch must be a multiple of {PACK_BLOCK_SIZE}: "
-                    f"{sizes}"
+                    f"{self.seqpack_candidate_count}"
                 )
-            shortest_mean_history = self._history_mean_len(sizes[-1])
+            shortest_mean_history = self._history_mean_len(self.seqpack_candidate_count[-1])
             if shortest_mean_history < self.seqpack_distribution.min_len:
                 raise ValueError(
                     f"the largest candidate size leaves a mean history of {shortest_mean_history} "
                     f"tokens, below seqpack_distribution.min_len="
                     f"{self.seqpack_distribution.min_len}"
                 )
+        if (
+            isinstance(self.model_config, RecsysAggregatedModelConfig)
+            and self.model_config.page_rl.enabled
+        ):
+            if not (isinstance(self.dataset, PhoenixDataset) and self.dataset.page_records):
+                raise ValueError("page_rl needs a dataset with page_records=True")
+            if self.seqpack_candidate_packing:
+                raise ValueError("page_rl does not support seqpack_candidate_packing")
 
         self._init_shmem_write_pool()
         self._free_ports()
@@ -2134,7 +2480,8 @@ class RecsysTrainer(Trainer):
 
         @hk.transform
         def user_forward_fn(
-            batch: RecsysFeaturesBatch, recsys_embeddings: RecsysEmbeddingsParameter
+            batch: RecsysFeaturesBatch,
+            recsys_embeddings: RecsysEmbeddingsParameter,
         ):
             assert isinstance(self.model_config, RecsysTwoTowerModelConfig)
             return self.model_config.make(
@@ -2148,10 +2495,23 @@ class RecsysTrainer(Trainer):
         if self.num_microbatch > 1:
 
             def microbatch_loss_fns():
-                assert isinstance(self.model_config, RecsysAggregatedModelConfig)
+                assert isinstance(
+                    self.model_config, (RecsysAggregatedModelConfig, RecsysTwoTowerModelConfig)
+                )
                 model = self.model_config.make(
                     sharding_context=make_legacy_sharding_context(self.mesh)
                 )
+                if isinstance(model, RecsysTwoTowerModel):
+
+                    def loss(batch, recsys_embeddings, **kwargs):
+                        return model.loss(None, batch, recsys_embeddings, True, **kwargs)
+
+                    return model.loss, (
+                        model.loss_inputs_and_normalizers,
+                        model.candidate_pool,
+                        loss,
+                        model.metrics,
+                    )
                 return model.loss, (model.loss_inputs_and_normalizers, model.loss, model.metrics)
 
             self.microbatch_loss_fns = hk.multi_transform(microbatch_loss_fns)
@@ -2167,6 +2527,7 @@ class RecsysTrainer(Trainer):
                 top_k: int,
                 target_dataset_types,
                 eval_bs_per_device: int = 0,
+                query_head_weights: tuple[float, float] | None = None,
             ):
                 assert isinstance(self.model_config, RecsysTwoTowerModelConfig)
                 model = self.model_config.make(
@@ -2180,6 +2541,7 @@ class RecsysTrainer(Trainer):
                     top_k,
                     target_dataset_types,
                     eval_bs_per_device=eval_bs_per_device,
+                    query_head_weights=query_head_weights,
                 )
                 top_k_indices, top_k_scores = results[0]
                 return top_k_indices, top_k_scores
@@ -2275,9 +2637,10 @@ class RecsysTrainer(Trainer):
         if self.use_async_emb:
             self._create_async_emb_executables(init_data, lr_shape, compiler_options)
         else:
+            step_fn = self.forward_only_step if self.forward_only else self.update
             self.update_jit = JittedOrCompiled(
                 jax.jit(
-                    self.update,
+                    step_fn,
                     in_shardings=(
                         self.state_sharding,
                         self.data_sharding,
@@ -2345,7 +2708,7 @@ class RecsysTrainer(Trainer):
                     None,
                     None,
                 ),
-                static_argnums=[6, 7, 8],
+                static_argnums=[6, 7, 8, 9],
             )
 
             self.loss_fn_eval_jit = jax.jit(
@@ -2603,6 +2966,9 @@ class RecsysTrainer(Trainer):
             self.state = self.state._replace(step=jnp.array(self.step_count_start))
             res = (True, 0, 0)
 
+        if self.forward_only:
+            res = self._resume_forward_only(res)
+
         return res
 
     def purge_opt_state_on_load(self, host_state):
@@ -2842,6 +3208,8 @@ class RecsysTrainer(Trainer):
         return time.perf_counter() - start
 
     def save_checkpoint(self, *args, **kwargs):
+        if self.forward_only:
+            return None
         if not self.dense_params_ema_in_checkpoint or self._dense_params_ema is None:
             return self._save_checkpoint_current_params(*args, **kwargs)
         live_params = self.state.params
@@ -3139,26 +3507,43 @@ class RecsysTrainer(Trainer):
     def run(self) -> None:
         gc.disable()
         rank_logger.info("Disabled Python cyclic GC for the recsys training loop")
+        run_error = None
         try:
+            self._maybe_start_retrieval_corpus_stager()
             super().run()
+        except BaseException as error:
+            run_error = error
         finally:
-            exception_type = sys.exc_info()[0]
-            if (
-                exception_type is not None
-                and not issubclass(exception_type, StopIteration)
-                and self._async_emb_context is not None
-            ):
-                recsys_async_emb.kernel_api(self._async_emb_context).abort(
-                    self._async_emb_context.context_id
-                )
+            cleanup_errors = []
+            try:
+                self._stop_retrieval_corpus_stager()
+            except BaseException as error:
+                cleanup_errors.append(error)
+
+            failed = (
+                run_error is not None and not isinstance(run_error, StopIteration)
+            ) or cleanup_errors
+            if failed and self._async_emb_context is not None:
+                try:
+                    recsys_async_emb.kernel_api(self._async_emb_context).abort(
+                        self._async_emb_context.context_id
+                    )
+                except BaseException as error:
+                    cleanup_errors.append(error)
 
             shutdown = getattr(self.dataset, "shutdown", None)
             if callable(shutdown):
                 rank_logger.info("Stopping dataset background threads via shutdown()")
                 try:
                     shutdown()
-                except Exception:
-                    rank_logger.exception("dataset.shutdown() failed during teardown")
+                except BaseException as error:
+                    cleanup_errors.append(error)
+
+            if cleanup_errors:
+                errors = ([run_error] if run_error is not None else []) + cleanup_errors
+                raise BaseExceptionGroup("Recsys training or cleanup failed", errors)
+            if run_error is not None:
+                raise run_error.with_traceback(run_error.__traceback__)
 
     def two_int32_to_int64(self, two_int32: jax.Array | np.ndarray) -> npt.NDArray[np.int64]:
         low_64 = np.asarray(two_int32[:, 0], dtype=np.int64) & 0xFFFFFFFF
@@ -3251,13 +3636,8 @@ class RecsysTrainer(Trainer):
             getattr(self.model_config, "split_home_checkpoint", False)
         )
 
-    def maybe_build_retrieval_post_embeddings(self):
-        if not isinstance(self.model_config, RecsysTwoTowerModelConfig):
-            return
-
-        assert isinstance(self.state, RecsysTrainingState)
-        assert self.state.emb_table is not None
-
+    def _retrieval_checkpoint_datasets(self) -> list[RetrievalDataset]:
+        assert isinstance(self.model_config, RecsysTwoTowerModelConfig)
         if self.model_config.checkpoint_dataset_names is not None:
             valid_names = set(RetrievalDataset.__members__.keys())
             for name in self.model_config.checkpoint_dataset_names:
@@ -3288,10 +3668,138 @@ class RecsysTrainer(Trainer):
                 f"Loading configured retrieval datasets: {[ds.name for ds in target_datasets]}"
             )
 
+        return target_datasets
+
+    def _retrieval_stager_config(
+        self, target_datasets: list[RetrievalDataset] | None = None
+    ) -> corpus_stager.StagerConfig | None:
+        if not self.retrieval_staged_corpus:
+            return None
+        if not isinstance(self.model_config, RecsysTwoTowerModelConfig):
+            return None
+        if target_datasets is None:
+            target_datasets = self._retrieval_checkpoint_datasets()
+        names = tuple(ds.name for ds in target_datasets)
+        if corpus_stager.dataset_logical_paths(names) is None:
+            return None
+        user_cfg = self.model_config.user_tower_config
+        return corpus_stager.StagerConfig(
+            root=self.retrieval_staged_corpus_dir,
+            dataset_names=names,
+            max_posts=self.model_config.candidate_tower_config.max_posts,
+            read_post_sid=user_cfg.use_post_sid,
+            use_post_sid=user_cfg.use_post_sid,
+            sid_num_levels=user_cfg.sid_num_levels,
+            hash_table=corpus_stager.hash_table_config(
+                self.model_config.candidate_tower_config.hash_table
+            ),
+            poll_seconds=self.retrieval_staged_corpus_poll_seconds,
+        )
+
+    def _maybe_start_retrieval_corpus_stager(self) -> None:
+        config = self._retrieval_stager_config()
+        if config is None or not self._is_copy_port_binder():
+            return
+        env = dict(os.environ)
+        env["PYTHONPATH"] = os.pathsep.join(p for p in sys.path if p and os.path.isdir(p))
+        env["CUDA_VISIBLE_DEVICES"] = ""
+        env["JAX_PLATFORMS"] = "cpu"
+        self._retrieval_corpus_stager_proc = subprocess.Popen(
+            [
+                sys.executable,
+                "-m",
+                "xrex.train.retrieval_corpus_stager",
+                "--config-json",
+                config.to_json(),
+                "--parent-pid",
+                str(os.getpid()),
+            ],
+            env=env,
+            stdin=subprocess.DEVNULL,
+        )
+        rank_logger.info(
+            "Started retrieval corpus stager pid=%d staging into %s",
+            self._retrieval_corpus_stager_proc.pid,
+            config.staging_dir(),
+        )
+
+    def _stop_retrieval_corpus_stager(self) -> None:
+        proc = self._retrieval_corpus_stager_proc
+        if proc is None:
+            return
+        deadline = time.monotonic() + 10.0
+        proc.terminate()
+        try:
+            proc.wait(timeout=min(5.0, max(0.0, deadline - time.monotonic())))
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            try:
+                proc.wait(timeout=max(0.0, deadline - time.monotonic()))
+            except subprocess.TimeoutExpired as error:
+                raise RuntimeError(
+                    f"Corpus stager {proc.pid} did not exit within its cleanup deadline"
+                ) from error
+        self._retrieval_corpus_stager_proc = None
+
+    def _acquire_staged_retrieval_corpus(
+        self, config: corpus_stager.StagerConfig
+    ) -> tuple[int, dict[str, np.ndarray]] | None:
+        staging_dir = config.staging_dir()
+        generation = corpus_stager.agree_on_generation(
+            corpus_stager.list_staged_generations(staging_dir),
+            multihost_utils.process_allgather,
+        )
+        arrays: dict[str, np.ndarray] | None = None
+        if generation is not None:
+            try:
+                arrays = corpus_stager.open_staged_generation(staging_dir, generation)
+                corpus_stager.validate_staged_arrays(
+                    config,
+                    generation,
+                    arrays,
+                    corpus_stager.read_staged_meta(staging_dir, generation),
+                )
+            except Exception:
+                rank_logger.exception("Could not open staged corpus generation %s", generation)
+                arrays = None
+        opened = multihost_utils.process_allgather(np.array([arrays is not None], dtype=np.int32))
+        if generation is None or arrays is None or not bool(np.all(opened)):
+            rank_logger.info(
+                "No staged retrieval corpus usable on every process (generation=%s); "
+                "loading synchronously",
+                generation,
+            )
+            return None
+        return generation, arrays
+
+    def _staged_post_table_ids(
+        self, generation: int, staged_arrays: dict[str, np.ndarray]
+    ) -> tuple[jax.Array, jax.Array, typing.Any, bool]:
+        current = self.state.post_embeddings
+        num_rows = staged_arrays["post_ids"].shape[0]
+        current_ids = getattr(current, "post_ids", None)
+        if (
+            generation == self._post_table_ids_generation
+            and current_ids is not None
+            and tuple(current_ids.shape) == (num_rows, 2)
+        ):
+            return current.post_ids, current.author_ids, current.dataset_types, True
+        global_post_ids = multihost_utils.host_local_array_to_global_array(
+            _int64_as_int32_pairs(staged_arrays["post_ids"]), self.mesh, P(None)
+        )
+        global_author_ids = multihost_utils.host_local_array_to_global_array(
+            _int64_as_int32_pairs(staged_arrays["author_ids"]), self.mesh, P(None)
+        )
+        dataset_types = np.array(staged_arrays["dataset_types"], dtype=np.int32).reshape(-1, 1)
+        return global_post_ids, global_author_ids, dataset_types, False
+
+    def _load_retrieval_corpus_synchronously(
+        self, target_datasets: list[RetrievalDataset], max_posts: int
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, float]:
+        assert isinstance(self.model_config, RecsysTwoTowerModelConfig)
         _user_cfg = self.model_config.user_tower_config
         _use_post_sid = _user_cfg.use_post_sid
         _sid_num_levels = _user_cfg.sid_num_levels
-        max_posts = self.model_config.candidate_tower_config.max_posts
         if jax.process_index() == 0:
             post_ids, author_ids, dataset_types, post_sids_raw = RetrievalDataset.load_datasets(
                 target_datasets,
@@ -3307,6 +3815,7 @@ class RecsysTrainer(Trainer):
             author_ids = np.zeros(max_posts, dtype=np.int64)
             dataset_types = np.zeros(max_posts, dtype=np.int32)
             post_sids_raw = None
+        load_done = time.perf_counter()
         if post_sids_raw is None:
             post_sids_raw = np.full((max_posts, _sid_num_levels), -1, dtype=np.int32)
         post_ids_i32 = post_ids.view(np.int32)
@@ -3320,6 +3829,42 @@ class RecsysTrainer(Trainer):
         author_ids = np.asarray(author_ids_i32, dtype=np.int32).view(np.int64)
         dataset_types = np.asarray(dataset_types, dtype=np.int32)
         post_sids_raw = np.asarray(post_sids_raw, dtype=np.int32)
+        return post_ids, author_ids, dataset_types, post_sids_raw, load_done
+
+    def maybe_build_retrieval_post_embeddings(self):
+        if not isinstance(self.model_config, RecsysTwoTowerModelConfig):
+            return
+
+        assert isinstance(self.state, RecsysTrainingState)
+        assert self.state.emb_table is not None
+
+        build_start = time.perf_counter()
+        target_datasets = self._retrieval_checkpoint_datasets()
+
+        _user_cfg = self.model_config.user_tower_config
+        _use_post_sid = _user_cfg.use_post_sid
+        _sid_num_levels = _user_cfg.sid_num_levels
+        max_posts = self.model_config.candidate_tower_config.max_posts
+        stager_config = self._retrieval_stager_config(target_datasets)
+        staged = (
+            self._acquire_staged_retrieval_corpus(stager_config)
+            if stager_config is not None
+            else None
+        )
+        staged_arrays: dict[str, np.ndarray] | None = None
+        if staged is not None:
+            corpus_generation, staged_arrays = staged
+            corpus_label = f"staged:{corpus_generation}"
+            post_ids = staged_arrays["post_ids"]
+            author_ids = staged_arrays["author_ids"]
+            dataset_types = staged_arrays["dataset_types"]
+            load_done = broadcast_done = time.perf_counter()
+        else:
+            corpus_label = "sync"
+            post_ids, author_ids, dataset_types, post_sids_raw, load_done = (
+                self._load_retrieval_corpus_synchronously(target_datasets, max_posts)
+            )
+            broadcast_done = time.perf_counter()
         total_samples = len(post_ids)
         shard_size = total_samples // self.data_world_size
         start_idx = self.data_rank * shard_size
@@ -3328,63 +3873,90 @@ class RecsysTrainer(Trainer):
             if self.data_rank < self.data_world_size - 1
             else total_samples
         )
-        post_ids_shard = post_ids[start_idx:end_idx]
-        author_ids_shard = author_ids[start_idx:end_idx]
         dataset_types_shard = dataset_types[start_idx:end_idx]
 
-        _hash_table = self.model_config.candidate_tower_config.hash_table
-        post_hashes_shard = _hash_table.get_item_hash(post_ids_shard)
-        author_hashes_shard = _hash_table.get_author_hash(author_ids_shard)
+        if staged_arrays is not None:
+            post_hashes_shard = np.asarray(staged_arrays["item_hashes"][start_idx:end_idx])
+            author_hashes_shard = np.asarray(staged_arrays["author_hashes"][start_idx:end_idx])
+            post_sids_u16_shard = np.asarray(staged_arrays["post_sids_u16"][start_idx:end_idx])
+        else:
+            _hash_table = self.model_config.candidate_tower_config.hash_table
+            post_hashes_shard = _hash_table.get_item_hash(post_ids[start_idx:end_idx])
+            author_hashes_shard = _hash_table.get_author_hash(author_ids[start_idx:end_idx])
+            post_sids_raw_shard = post_sids_raw[start_idx:end_idx]
+            if _use_post_sid:
+                post_sids_u16_shard = (post_sids_raw_shard + 1).astype(np.uint16)
+            else:
+                post_sids_u16_shard = np.zeros_like(post_sids_raw_shard, dtype=np.uint16)
         if _user_cfg.use_post_embedding:
-            combined_hashes_shard = jnp.concatenate(
-                [post_hashes_shard, author_hashes_shard], axis=1
-            )
+            combined_hashes_np = np.concatenate([post_hashes_shard, author_hashes_shard], axis=1)
         else:
-            combined_hashes_shard = author_hashes_shard
-        post_sids_raw_shard = post_sids_raw[start_idx:end_idx]
-        if _use_post_sid:
-            post_sids_u16_shard = (post_sids_raw_shard + 1).astype(np.uint16)
-        else:
-            post_sids_u16_shard = np.zeros_like(post_sids_raw_shard, dtype=np.uint16)
+            combined_hashes_np = author_hashes_shard
+        post_hashes_np = np.asarray(post_hashes_shard)
+        hash_done = time.perf_counter()
 
         rng, _new_rng = jax.random.split(self.state.rng)
 
-        combined_hashes_np = np.asarray(combined_hashes_shard)
-        post_hashes_np = np.asarray(post_hashes_shard)
         _shard_rows = combined_hashes_np.shape[0]
         if total_samples % self.data_world_size == 0:
-            _chunk_rows = min(_shard_rows, 65536)
+            _chunk_rows = min(_shard_rows, self.retrieval_post_table_chunk_rows)
         else:
             _chunk_rows = _shard_rows
+        if self._post_table_lookup_jit is None:
+            embedding_param = replace(self.state.emb_table, x=None)
 
-        def _forward_chunked(head_index: int) -> jax.Array:
+            def lookup(table, hashes):
+                return self._lookup(replace(embedding_param, x=table), hashes).x
+
+            self._post_table_lookup_jit = jax.jit(
+                lookup,
+                in_shardings=(self.state.emb_table.x.sharding, self.data_sharding),
+                out_shardings=self.data_sharding,
+            )
+        emb_table_x = self.state.emb_table.x
+
+        def _run_chunk(
+            head_index: int, hashes: jax.Array, sids: jax.Array, post_hashes: jax.Array
+        ) -> jax.Array:
+            post_author_embedding = self._post_table_lookup_jit(emb_table_x, hashes)
+            return self.candidate_tower_forward_jit(
+                self.state.params,
+                rng,
+                post_author_embedding,
+                sids,
+                post_hashes,
+                head_index,
+            )
+
+        def _forward_chunked_host(head_index: int) -> jax.Array:
             outs: list[np.ndarray] = []
             for _start in range(0, _shard_rows, _chunk_rows):
                 _sl = slice(_start, min(_start + _chunk_rows, _shard_rows))
-                _hashes_jax = jax.make_array_from_process_local_data(
-                    self.data_sharding, combined_hashes_np[_sl]
-                )
-                _pae = self._lookup(self.state.emb_table, _hashes_jax)
-                _sids_jax = jax.make_array_from_process_local_data(
-                    self.data_sharding, post_sids_u16_shard[_sl]
-                )
-                _ph_jax = jax.make_array_from_process_local_data(
-                    self.data_sharding, post_hashes_np[_sl]
-                )
-                _out = self.candidate_tower_forward_jit(
-                    self.state.params,
-                    rng,
-                    _pae.x,
-                    _sids_jax,
-                    _ph_jax,
+                _out = _run_chunk(
                     head_index,
+                    *(
+                        jax.make_array_from_process_local_data(self.data_sharding, x[_sl])
+                        for x in (combined_hashes_np, post_sids_u16_shard, post_hashes_np)
+                    ),
                 )
                 _local_shards = sorted(_out.addressable_shards, key=lambda s: s.index[0].start or 0)
                 outs.append(np.concatenate([np.asarray(s.data) for s in _local_shards], axis=0))
-                del _out, _pae
+                del _out
             return jax.make_array_from_process_local_data(
                 self.data_sharding, np.concatenate(outs, axis=0)
             )
+
+        def _forward_chunked(head_index: int) -> jax.Array:
+            if total_samples % self.data_world_size == 0:
+                result = _chunked_row_forward_on_device(
+                    self.data_sharding,
+                    (combined_hashes_np, post_sids_u16_shard, post_hashes_np),
+                    functools.partial(_run_chunk, head_index),
+                    _chunk_rows,
+                )
+                if result is not None:
+                    return result
+            return _forward_chunked_host(head_index)
 
         head_dataset_mapping = getattr(self.model_config, "head_dataset_mapping", None)
         num_heads = self.model_config.candidate_tower_config.num_candidate_heads
@@ -3402,20 +3974,39 @@ class RecsysTrainer(Trainer):
                 head_indices_shard,
             )
             for h in range(1, num_heads):
+                if h not in dataset_to_head.values():
+                    continue
                 emb_h = _forward_chunked(h)
                 mask_h = post_head_jax == h
                 candidate_embeddings = jnp.where(mask_h, emb_h, candidate_embeddings)
                 del emb_h
 
-        global_post_ids = multihost_utils.host_local_array_to_global_array(
-            self.int64_to_two_int32(post_ids), self.mesh, P(None)
-        )
-        global_author_ids = multihost_utils.host_local_array_to_global_array(
-            self.int64_to_two_int32(author_ids), self.mesh, P(None)
-        )
-        combined_dataset_types = multihost_utils.process_allgather(
-            dataset_types_shard, tiled=True
-        ).reshape(-1, 1)
+        ld_head = self.model_config.ld_head
+        if ld_head is not None:
+            emb_ld = _forward_chunked(ld_head)
+            candidate_embeddings = jax.device_put(
+                jnp.concatenate([candidate_embeddings, emb_ld], axis=-1), self.data_sharding
+            )
+            del emb_ld
+
+        jax.block_until_ready(candidate_embeddings)
+        forward_done = time.perf_counter()
+
+        ids_reused = False
+        if staged_arrays is not None:
+            global_post_ids, global_author_ids, combined_dataset_types, ids_reused = (
+                self._staged_post_table_ids(corpus_generation, staged_arrays)
+            )
+        else:
+            global_post_ids = multihost_utils.host_local_array_to_global_array(
+                self.int64_to_two_int32(post_ids), self.mesh, P(None)
+            )
+            global_author_ids = multihost_utils.host_local_array_to_global_array(
+                self.int64_to_two_int32(author_ids), self.mesh, P(None)
+            )
+            combined_dataset_types = multihost_utils.process_allgather(
+                dataset_types_shard, tiled=True
+            ).reshape(-1, 1)
 
         original_embeddings = self.state.post_embeddings.embeddings
         mol_side_table = self.state.post_embeddings.mol_side_table
@@ -3444,27 +4035,64 @@ class RecsysTrainer(Trainer):
             mol_side_table=mol_side_table,
         )
         self.state = self.state._replace(post_embeddings=post_embeddings)
+        self._post_table_ids_generation = corpus_generation if staged_arrays is not None else None
+        build_done = time.perf_counter()
+        rank_logger.info(
+            "Built retrieval post table: corpus=%s rows=%d shard_rows=%d chunk_rows=%d "
+            "load=%.2fs broadcast=%.2fs hash=%.2fs forward=%.2fs ids=%.2fs total=%.2fs "
+            "ids_reused=%d",
+            corpus_label,
+            total_samples,
+            _shard_rows,
+            _chunk_rows,
+            load_done - build_start,
+            broadcast_done - load_done,
+            hash_done - broadcast_done,
+            forward_done - hash_done,
+            build_done - forward_done,
+            build_done - build_start,
+            int(ids_reused),
+        )
 
     def maybe_build_gen_recs_post_embeddings(self) -> None:
         pass
+
+    def _eval_embeddings_fn(
+        self,
+    ) -> typing.Callable[[RecsysFeaturesBatch], RecsysEmbeddingsParameter]:
+        if self._eval_lookup_jit is None:
+            embedding_param = replace(self.state.emb_table, x=None)
+
+            def lookup(table, batch):
+                return self.get_recsys_embeddings(batch, replace(embedding_param, x=table))
+
+            self._eval_lookup_jit = jax.jit(lookup, out_shardings=self.data_sharding)
+        last: list[typing.Any] = []
+
+        def embeddings(batch: RecsysFeaturesBatch) -> RecsysEmbeddingsParameter:
+            if not last or last[0] is not batch:
+                last[:] = [batch, self._eval_lookup_jit(self.state.emb_table.x, batch)]
+            return last[1]
+
+        return embeddings
 
     def eval_two_tower(self, soft_step: int):
         assert isinstance(self.state, RecsysTrainingState)
         assert isinstance(self.model_config, RecsysTwoTowerModelConfig)
         rank_logger.info("Running evals at %s", soft_step)
         rng, _new_rng = jax.random.split(self.state.rng)
+        eval_embeddings = self._eval_embeddings_fn()
 
         def _two_tower_eval_forward_fn(
-            batch, post_embeddings, dataset_types, top_k, target_dataset_types, eval_bs_per_device=0
+            query_head_weights,
+            batch,
+            post_embeddings,
+            dataset_types,
+            top_k,
+            target_dataset_types,
+            eval_bs_per_device=0,
         ):
-            recsys_embeddings_parameter = self.get_recsys_embeddings(
-                batch,
-                self.state.emb_table,
-            )
-            recsys_embeddings = get_recsys_embed_param_to_jax_array(recsys_embeddings_parameter)
-            recsys_embeddings = jax.tree_util.tree_map(
-                lambda x: jax.device_put(x, self.data_sharding), recsys_embeddings
-            )
+            recsys_embeddings = get_recsys_embed_param_to_jax_array(eval_embeddings(batch))
             return self.two_tower_forward_jit(
                 self.state.params,
                 rng,
@@ -3475,6 +4103,7 @@ class RecsysTrainer(Trainer):
                 top_k,
                 target_dataset_types,
                 eval_bs_per_device,
+                query_head_weights,
             )
 
         _eval_user_cfg = self.model_config.user_tower_config
@@ -3514,21 +4143,10 @@ class RecsysTrainer(Trainer):
         _candidate_tower_eval_forward_fn = _make_candidate_tower_eval_fn(0)
 
         def _loss_fn(batch: RecsysFeaturesBatch):
-            recsys_embeddings_param: RecsysEmbeddingsParameter = self.get_recsys_embeddings(
-                batch,
-                self.state.emb_table,
-            )
-            recsys_embeddings_param = jax.tree_util.tree_map(
-                lambda x: jax.device_put(x, self.data_sharding), recsys_embeddings_param
-            )
-            return self.loss_fn_eval_jit(self.state.params, rng, batch, recsys_embeddings_param)
+            return self.loss_fn_eval_jit(self.state.params, rng, batch, eval_embeddings(batch))
 
         def _user_emb_fn(batch: RecsysFeaturesBatch):
-            recsys_embeddings_param = self.get_recsys_embeddings(batch, self.state.emb_table)
-            recsys_embeddings_param = jax.tree_util.tree_map(
-                lambda x: jax.device_put(x, self.data_sharding), recsys_embeddings_param
-            )
-            return self.user_forward_jit(self.state.params, rng, batch, recsys_embeddings_param)
+            return self.user_forward_jit(self.state.params, rng, batch, eval_embeddings(batch))
 
         all_eval_metrics = {}
         if self.state.post_embeddings is None or self.state.post_embeddings.post_ids is None:
@@ -3547,7 +4165,7 @@ class RecsysTrainer(Trainer):
                 eval_module.eval_name,
                 eval_module.eval_conf,
                 eval_module.eval_dataset,
-                eval_module.eval_bs_per_device,
+                int(eval_module.eval_bs_per_device),
                 eval_module.eval_seq_len,
             )
             if not isinstance(eval_conf, RecsysTwoTowerEval):
@@ -3557,11 +4175,12 @@ class RecsysTrainer(Trainer):
             if head_dataset_mapping is not None:
                 eval_head_idx = head_dataset_mapping.get(eval_conf.target_dataset_type.name, 0)
             eval_cand_fn = _make_candidate_tower_eval_fn(eval_head_idx)
+            query_head_weights = eval_conf.query_head_weights
 
             eval_results = run_recsys_evals(
                 evals=[(eval_name, eval_conf)],
                 train_dataset=self.dataset_thread_iterator(self._eval_dataset, prepare_data=False),
-                forward_fn=_two_tower_eval_forward_fn,
+                forward_fn=functools.partial(_two_tower_eval_forward_fn, query_head_weights),
                 loss_fn=_loss_fn,
                 mesh=self.mesh,
                 rng=rng,

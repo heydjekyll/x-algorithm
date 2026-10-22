@@ -1,16 +1,19 @@
 use crate::models::candidate::PostCandidate;
 use crate::models::query::ScoredPostsQuery;
 use crate::params::{
-    EnablePhoenixRetrievalFallback, EnablePhoenixSource, PhoenixColdStartMaxResults,
-    PhoenixMaxResults, PhoenixRetrievalExcludeSeenPosts, PhoenixRetrievalInferenceClusterId,
+    EnablePhoenixSource, PhoenixColdStartMaxResults, PhoenixMaxResults,
+    PhoenixRetrievalExcludeSeenPosts, PhoenixRetrievalInferenceClusterId,
     PhoenixRetrievalNewUserHistoryThreshold, PhoenixRetrievalNewUserInferenceClusterId,
-    PhoenixXdsRetrievalMaxRetries,
+    PhoenixXdsRetrievalMaxRetries, RetrievalValueModelWeights,
 };
-use crate::util::egress::RetrievalDispatch;
 use crate::util::phoenix_request::{
     build_client_context, build_user_context, candidates_from_retrieval_response,
+    retrieval_value_model_weights,
 };
+use rustc_hash::FxHashSet;
+use std::sync::Arc;
 use tonic::async_trait;
+use xai_candidate_pipeline::component_library::clients::phoenix_retrieval_client::PhoenixRetrievalClient;
 use xai_candidate_pipeline::component_library::clients::phoenix_retrieval_client::{
     PhoenixRetrievalCluster, RetrievalExclusions,
 };
@@ -18,9 +21,13 @@ use xai_candidate_pipeline::component_library::utils::quality_factor;
 use xai_candidate_pipeline::source::Source;
 use xai_home_mixer_proto as pb;
 use xai_recsys_proto::RetrievalDatasetType;
+use xai_stats_receiver::global_stats_receiver;
+
+const ZERO_FAV_RETRIEVED_METRIC: &str = "ScoredStats.PhoenixRetrievalZeroFavTweets.Retrieved";
+const SOCIALGRAPH_RETRIEVED_METRIC: &str = "PhoenixSource.SocialgraphRetrieved";
 
 pub struct PhoenixSource {
-    pub dispatch: RetrievalDispatch,
+    pub phoenix_retrieval_client: Arc<dyn PhoenixRetrievalClient + Send + Sync>,
 }
 
 impl PhoenixSource {
@@ -115,9 +122,8 @@ impl Source<ScoredPostsQuery, PostCandidate> for PhoenixSource {
         let user_context = build_user_context(query);
 
         let response = self
-            .dispatch
-            .retrieve_with_fallback_excluding(
-                query,
+            .phoenix_retrieval_client
+            .retrieve_excluding(
                 cluster,
                 user_id,
                 sequence.clone(),
@@ -129,26 +135,72 @@ impl Source<ScoredPostsQuery, PostCandidate> for PhoenixSource {
                 client_context,
                 user_context,
                 query.params.get(PhoenixXdsRetrievalMaxRetries),
-                query.params.get(EnablePhoenixRetrievalFallback),
                 vec![],
                 Self::seen_post_exclusions(query),
+                retrieval_value_model_weights(&query.params.get(RetrievalValueModelWeights)),
             )
             .await
             .map_err(|e| format!("PhoenixSource: {e}"))?;
 
-        Ok(candidates_from_retrieval_response(
-            response,
-            served_type_for_dataset,
-            cluster,
-        ))
+        let candidates =
+            candidates_from_retrieval_response(response, served_type_for_dataset, cluster);
+        record_zero_fav_retrieved(&candidates);
+        record_socialgraph_retrieved(query, &candidates);
+        Ok(candidates)
     }
 }
 
+fn record_socialgraph_retrieved(query: &ScoredPostsQuery, candidates: &[PostCandidate]) {
+    let Some(receiver) = global_stats_receiver() else {
+        return;
+    };
+    let muted: FxHashSet<i64> = query.user_features.muted_user_ids.iter().copied().collect();
+    let blocked: FxHashSet<i64> = query
+        .user_features
+        .blocked_user_ids
+        .iter()
+        .copied()
+        .collect();
+    let (mut muted_count, mut blocked_count) = (0u64, 0u64);
+    for c in candidates {
+        let author_id = c.author_id as i64;
+        muted_count += muted.contains(&author_id) as u64;
+        blocked_count += blocked.contains(&author_id) as u64;
+    }
+    let m = SOCIALGRAPH_RETRIEVED_METRIC;
+    receiver.incr(m, &[("type", "requests")], 1);
+    receiver.incr(m, &[("type", "retrieved")], candidates.len() as u64);
+    if muted_count > 0 {
+        receiver.incr(m, &[("type", "muted")], muted_count);
+    }
+    if blocked_count > 0 {
+        receiver.incr(m, &[("type", "blocked")], blocked_count);
+    }
+    if muted_count + blocked_count > 0 {
+        receiver.incr(m, &[("type", "requests_with_hit")], 1);
+    }
+}
+
+fn record_zero_fav_retrieved(candidates: &[PostCandidate]) {
+    let count = candidates
+        .iter()
+        .filter(|c| c.served_type == Some(pb::ServedType::ForYouPhoenixRetrievalZeroFav))
+        .count() as u64;
+    if count == 0 {
+        return;
+    }
+    let Some(receiver) = global_stats_receiver() else {
+        return;
+    };
+    receiver.incr(ZERO_FAV_RETRIEVED_METRIC, &[("type", "sum")], count);
+    receiver.incr(ZERO_FAV_RETRIEVED_METRIC, &[("type", "requests")], 1);
+}
+
 fn served_type_for_dataset(dataset_type: u32) -> pb::ServedType {
-    if dataset_type == RetrievalDatasetType::HomeCold as u32 {
-        pb::ServedType::ForYouPhoenixRetrievalCold
-    } else {
-        pb::ServedType::ForYouPhoenixRetrieval
+    match RetrievalDatasetType::try_from(dataset_type as i32) {
+        Ok(RetrievalDatasetType::HomeCold) => pb::ServedType::ForYouPhoenixRetrievalCold,
+        Ok(RetrievalDatasetType::ZeroFav) => pb::ServedType::ForYouPhoenixRetrievalZeroFav,
+        _ => pb::ServedType::ForYouPhoenixRetrieval,
     }
 }
 
@@ -160,10 +212,7 @@ mod tests {
 
     fn source() -> PhoenixSource {
         PhoenixSource {
-            dispatch: RetrievalDispatch {
-                prod: Arc::new(MockRetrievalClient),
-                paths: vec![],
-            },
+            phoenix_retrieval_client: Arc::new(MockRetrievalClient),
         }
     }
 

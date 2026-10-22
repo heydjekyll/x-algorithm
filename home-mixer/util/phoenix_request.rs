@@ -1,7 +1,11 @@
 use crate::models::candidate::{CandidateHelpers, PostCandidate, RetrievalSource};
 use crate::models::query::ScoredPostsQuery;
 use crate::params::{PhoenixExperimentOverrides, RerankerHeadTag};
+use crate::util::post_engagers::set_post_engagers;
 use rustc_hash::{FxHashMap, FxHashSet};
+use std::collections::HashMap;
+use std::sync::{Arc, LazyLock, RwLock};
+use tracing::warn;
 use xai_candidate_pipeline::component_library::clients::phoenix_prediction_client::TOP_LOG_PROBS_NUM;
 use xai_candidate_pipeline::component_library::clients::phoenix_retrieval_client::PhoenixRetrievalCluster;
 use xai_geo_ip::zip_to_dma_code;
@@ -11,8 +15,16 @@ use xai_recsys_proto::{
     PredictNextActionsRequest, ProductSurface, RetrieveTopKCandidatesResponse, TweetInfo,
     UserContext,
 };
+use xai_stats_receiver::global_stats_receiver;
 
 const PHOENIX_CLIENT_MAX_CANDIDATES: usize = 2800;
+const RETRIEVAL_VALUE_MODEL_WEIGHTS_METRIC: &str = "PhoenixRetrieval.ValueModelWeights";
+const MAX_CACHED_VALUE_MODEL_WEIGHTS: usize = 64;
+
+type ParsedValueModelWeights = Option<Arc<HashMap<String, f32>>>;
+
+static VALUE_MODEL_WEIGHTS: LazyLock<RwLock<HashMap<String, ParsedValueModelWeights>>> =
+    LazyLock::new(Default::default);
 
 pub fn candidates_from_retrieval_response(
     response: RetrieveTopKCandidatesResponse,
@@ -158,21 +170,27 @@ fn candidate_to_tweet_info(
     c: &PostCandidate,
     query: &ScoredPostsQuery,
     followed_ids: &FxHashSet<u64>,
+    serve_time_ms: i64,
 ) -> xai_recsys_proto::TweetInfo {
     let is_followed = followed_ids.contains(&c.get_original_author_id())
         || c.get_original_author_id() == query.user_id;
-    c.as_tweet_info(is_followed)
+    let mut tweet_info = c.as_tweet_info(is_followed);
+    if let Some(record) = &c.post_engagers {
+        set_post_engagers(&mut tweet_info, record, query.user_id, serve_time_ms);
+    }
+    tweet_info
 }
 
 pub fn build_tweet_infos(
     query: &ScoredPostsQuery,
     candidates: &[PostCandidate],
+    serve_time_ms: i64,
 ) -> Vec<xai_recsys_proto::TweetInfo> {
     let followed_ids = followed_user_ids(query);
     candidates
         .iter()
         .take(PHOENIX_CLIENT_MAX_CANDIDATES)
-        .map(|c| candidate_to_tweet_info(c, query, &followed_ids))
+        .map(|c| candidate_to_tweet_info(c, query, &followed_ids, serve_time_ms))
         .collect()
 }
 
@@ -211,16 +229,101 @@ pub fn parse_experiment_overrides(spec: &str) -> std::collections::HashMap<Strin
         .collect()
 }
 
+pub fn retrieval_value_model_weights(spec: &str) -> HashMap<String, f32> {
+    if spec.is_empty() {
+        return HashMap::new();
+    }
+    let parsed = cached_value_model_weights(spec);
+    if let Some(receiver) = global_stats_receiver() {
+        let result = if parsed.is_some() { "sent" } else { "invalid" };
+        receiver.incr(
+            RETRIEVAL_VALUE_MODEL_WEIGHTS_METRIC,
+            &[("result", result)],
+            1,
+        );
+    }
+    parsed
+        .map(|weights| weights.as_ref().clone())
+        .unwrap_or_default()
+}
+
+fn cached_value_model_weights(spec: &str) -> ParsedValueModelWeights {
+    if let Some(parsed) = VALUE_MODEL_WEIGHTS
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(spec)
+    {
+        return parsed.clone();
+    }
+    let parsed = parse_value_model_weights(spec)
+        .inspect_err(|e| {
+            warn!("rust_home_mixer_retrieval_value_model_weights {spec:?} is not sent: {e}")
+        })
+        .ok()
+        .map(Arc::new);
+    let mut cache = VALUE_MODEL_WEIGHTS
+        .write()
+        .unwrap_or_else(|e| e.into_inner());
+    if cache.len() >= MAX_CACHED_VALUE_MODEL_WEIGHTS {
+        cache.clear();
+    }
+    cache.insert(spec.to_string(), parsed.clone());
+    parsed
+}
+
+pub fn parse_value_model_weights(spec: &str) -> Result<HashMap<String, f32>, String> {
+    let weights: HashMap<String, f64> = serde_json::from_str(spec).map_err(|e| e.to_string())?;
+    weights
+        .into_iter()
+        .map(|(name, weight)| {
+            let weight = weight as f32;
+            if weight.is_finite() {
+                Ok((name, weight))
+            } else {
+                Err(format!("weight of {name:?} is not a finite f32"))
+            }
+        })
+        .collect()
+}
+
 pub fn build_prediction_request(
     query: &ScoredPostsQuery,
     candidates: &[PostCandidate],
     product_surface: ProductSurface,
+    serve_time_ms: i64,
 ) -> PredictNextActionsRequest {
     let mut request = build_request_without_sequence_and_candidates(query, product_surface);
-    request.candidate_sets[0].candidates = build_tweet_infos(query, candidates);
+    request.candidate_sets[0].candidates = build_tweet_infos(query, candidates, serve_time_ms);
     let mut sequence = query.scoring_sequence.clone().unwrap_or_default();
     sequence.reranker_head_tag = Some(query.params.get(RerankerHeadTag) as u32);
     request.sequences = vec![sequence];
     request.columnar_sequences = query.columnar_scoring_sequence.iter().cloned().collect();
+    request
+}
+
+pub fn build_immersive_prediction_request(
+    query: &ScoredPostsQuery,
+    candidates: &[&PostCandidate],
+) -> PredictNextActionsRequest {
+    let mut request =
+        build_request_without_sequence_and_candidates(query, ProductSurface::GalleryPage);
+    request.return_backbone_scores = false;
+    let followed_ids = followed_user_ids(query);
+    request.candidate_sets[0].candidates = candidates
+        .iter()
+        .map(|candidate| {
+            let tweet_info =
+                candidate_to_tweet_info(candidate, query, &followed_ids, query.request_time_ms);
+            TweetInfo {
+                first_video_duration_ms: tweet_info.min_video_duration_ms,
+                ..tweet_info
+            }
+        })
+        .collect();
+    request.columnar_sequences = query
+        .immersive_columnar_scoring_sequence
+        .iter()
+        .cloned()
+        .collect();
     request
 }

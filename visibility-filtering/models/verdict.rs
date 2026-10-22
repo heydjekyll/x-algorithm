@@ -1,5 +1,6 @@
 use crate::hydration::{Hydrators, Lookup};
 use crate::params::LimitedActionType;
+use crate::rules::RuleId;
 use xai_visibility_filtering::models::FilteredReason;
 use xai_x_thrift::action::{AppealablePolicy, InterstitialAction, InterstitialReason};
 
@@ -33,6 +34,7 @@ pub struct FosnrReason {
 #[derive(Clone, Debug, PartialEq)]
 pub struct Decided<T> {
     pub value: T,
+    pub(crate) id: RuleId,
     pub by: &'static str,
 }
 
@@ -101,10 +103,12 @@ impl LimitedEngagement {
         }
     }
 
-    pub fn add(&mut self, reason: LimitedEngagementReason) {
-        if !self.reasons().any(|held| held == reason) {
+    pub fn add(&mut self, reason: LimitedEngagementReason) -> bool {
+        let added = !self.reasons().any(|held| held == reason);
+        if added {
             self.rest.push(reason);
         }
+        added
     }
 
     pub fn reason(&self) -> LimitedEngagementReason {
@@ -119,6 +123,7 @@ impl LimitedEngagement {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, strum::IntoStaticStr)]
 #[strum(serialize_all = "snake_case")]
 pub enum TombstoneReason {
+    Bounced,
     SensitiveViewerAgeVerification,
     UpdateAppIos,
     UpdateAppAndroid,
@@ -162,9 +167,23 @@ impl LimitedEngagementReason {
 }
 
 impl Verdict {
+    pub(crate) fn limited_engagement_reasons(
+        &self,
+    ) -> impl Iterator<Item = LimitedEngagementReason> + '_ {
+        let limit = match self {
+            Self::Shown {
+                engagement: Some(limit),
+                ..
+            } => Some(limit),
+            Self::Shown { .. } | Self::Withheld(_) => None,
+        };
+        limit.into_iter().flat_map(|limit| limit.value.reasons())
+    }
+
     pub const fn not_found() -> Self {
         Self::Withheld(Decided {
             value: Withholding::Drop(DropReason::Legacy(FilteredReason::UnspecifiedReason)),
+            id: RuleId::NotFound,
             by: "not_found",
         })
     }
@@ -172,6 +191,7 @@ impl Verdict {
     pub const fn lookup_failed() -> Self {
         Self::Withheld(Decided {
             value: Withholding::Drop(DropReason::Legacy(FilteredReason::UnspecifiedReason)),
+            id: RuleId::LookupFailed,
             by: "lookup_failed",
         })
     }
@@ -184,6 +204,7 @@ static LOOKUP_FAILED: Verdict = Verdict::lookup_failed();
 pub enum Evaluation {
     Complete {
         verdict: Verdict,
+        fail_open_defaults: Hydrators,
     },
     Partial {
         verdict: Verdict,
@@ -196,7 +217,7 @@ pub enum Evaluation {
 impl Evaluation {
     pub fn verdict(&self) -> &Verdict {
         match self {
-            Self::Complete { verdict } | Self::Partial { verdict, .. } => verdict,
+            Self::Complete { verdict, .. } | Self::Partial { verdict, .. } => verdict,
             Self::NotFound(_) => &NOT_FOUND,
             Self::Failed(_) => &LOOKUP_FAILED,
         }
@@ -204,18 +225,28 @@ impl Evaluation {
 
     pub fn into_verdict(self) -> Verdict {
         match self {
-            Self::Complete { verdict } | Self::Partial { verdict, .. } => verdict,
+            Self::Complete { verdict, .. } | Self::Partial { verdict, .. } => verdict,
             Self::NotFound(_) => Verdict::not_found(),
             Self::Failed(_) => Verdict::lookup_failed(),
         }
     }
 
+    pub const fn complete(verdict: Verdict) -> Self {
+        Self::Complete {
+            verdict,
+            fail_open_defaults: Hydrators::empty(),
+        }
+    }
+
     pub fn fail_open_defaults(&self) -> Hydrators {
         match self {
-            Self::Partial {
+            Self::Complete {
+                fail_open_defaults, ..
+            }
+            | Self::Partial {
                 fail_open_defaults, ..
             } => *fail_open_defaults,
-            Self::Complete { .. } | Self::NotFound(_) | Self::Failed(_) => Hydrators::empty(),
+            Self::NotFound(_) | Self::Failed(_) => Hydrators::empty(),
         }
     }
 }

@@ -1,12 +1,13 @@
-use crate::hydration::Hydrator;
+use crate::hydration::{Hydrator, Hydrators};
 use crate::models::{
     AuthorFeatures, AuthorLabel, ClientCapability, ConversationControlFeatures, Decided,
-    DropReason, FosnrReason, HydratedTweetCandidate, LimitedEngagement, LimitedEngagementReason,
-    MediaInterstitial, MediaRestriction, Notice, NsfwViewerDropReason, SafetyLabelMap,
-    SafetyLabelType, TombstoneReason, TweetFeatures, Verdict, VerifyBlurSupport, Viewer,
-    ViewerFeatures, ViewerProfile, Withholding,
+    DropReason, FosnrReason, LimitedEngagement, LimitedEngagementReason, MediaInterstitial,
+    MediaRestriction, Notice, NsfwViewerDropReason, PostCandidate, PostEntity, SafetyLabelMap,
+    SafetyLabelType, TombstoneReason, TweetFeatures, UserEntity, Verdict, VerifyBlurSupport,
+    Viewer, ViewerFeatures, ViewerProfile, Withholding,
 };
 use crate::params::LimitedActionType;
+use crate::rules::RuleId;
 use std::collections::HashSet;
 use xai_core_entities::entities::{ConversationControl, ConversationControlArm};
 use xai_visibility_filtering::models::FilteredReason;
@@ -50,6 +51,7 @@ pub(crate) const CLIENT_CLASSES: [ClientClass; 8] = {
                 gore_blur_ignores_settings,
                 fosnr_rules: true,
                 fosnr_fallback_drops: false,
+                soft_nsfw_new_user_drop: false,
             },
         }
     }
@@ -136,6 +138,10 @@ pub(crate) const CLIENT_CLASSES: [ClientClass; 8] = {
     ]
 };
 
+fn id_of(by: &str) -> RuleId {
+    RuleId::of_rule_name(by).unwrap_or(RuleId::FilterAll)
+}
+
 pub(crate) fn allow() -> Verdict {
     Verdict::Shown {
         notice: None,
@@ -153,6 +159,7 @@ pub(crate) fn noticed(proactive: bool, appeal_submitted: bool, by: &'static str)
                 proactive,
                 appeal_submitted,
             }),
+            id: id_of(by),
             by,
         }),
         media: None,
@@ -198,6 +205,7 @@ pub(crate) fn appealed(
                 },
                 limited_actions,
             },
+            id: id_of(by),
             by,
         }),
         media: None,
@@ -208,6 +216,7 @@ pub(crate) fn appealed(
 pub(crate) fn dropped(reason: FilteredReason, by: &'static str) -> Verdict {
     Verdict::Withheld(Decided {
         value: Withholding::Drop(DropReason::Legacy(reason)),
+        id: id_of(by),
         by,
     })
 }
@@ -215,6 +224,7 @@ pub(crate) fn dropped(reason: FilteredReason, by: &'static str) -> Verdict {
 pub(crate) fn nsfw_viewer_dropped(reason: NsfwViewerDropReason, by: &'static str) -> Verdict {
     Verdict::Withheld(Decided {
         value: Withholding::Drop(DropReason::NsfwViewer(reason)),
+        id: id_of(by),
         by,
     })
 }
@@ -222,6 +232,7 @@ pub(crate) fn nsfw_viewer_dropped(reason: NsfwViewerDropReason, by: &'static str
 pub(crate) fn tombstoned(reason: TombstoneReason, by: &'static str) -> Verdict {
     Verdict::Withheld(Decided {
         value: Withholding::Tombstone(reason),
+        id: id_of(by),
         by,
     })
 }
@@ -251,6 +262,7 @@ fn media_blurred(
                 reason,
                 prompt,
             }),
+            id: id_of(by),
             by,
         }),
         engagement: None,
@@ -262,6 +274,7 @@ pub(crate) fn legacy_interstitial(by: &'static str) -> Verdict {
         notice: None,
         media: Some(Decided {
             value: MediaRestriction::NsfwInterstitial,
+            id: id_of(by),
             by,
         }),
         engagement: None,
@@ -281,7 +294,11 @@ pub(crate) fn limited_for(reasons: &[LimitedEngagementReason], by: &'static str)
     Verdict::Shown {
         notice: None,
         media: None,
-        engagement: Some(Decided { value, by }),
+        engagement: Some(Decided {
+            value,
+            id: id_of(by),
+            by,
+        }),
     }
 }
 
@@ -354,10 +371,17 @@ pub(super) fn conversation_control(
 
 pub(crate) fn candidate() -> CandidateBuilder {
     CandidateBuilder {
-        candidate: HydratedTweetCandidate {
-            tweet_id: TWEET_ID,
-            author_id: AUTHOR_ID,
-            ..Default::default()
+        candidate: PostCandidate {
+            author: UserEntity {
+                id: AUTHOR_ID,
+                ..Default::default()
+            },
+            post: PostEntity {
+                tweet_id: TWEET_ID,
+                ..Default::default()
+            },
+            viewer_relationship: Default::default(),
+            failed: Hydrators::empty(),
         },
         labels: HashSet::new(),
         agent_labels: HashSet::new(),
@@ -365,14 +389,14 @@ pub(crate) fn candidate() -> CandidateBuilder {
 }
 
 pub(crate) struct CandidateBuilder {
-    candidate: HydratedTweetCandidate,
+    candidate: PostCandidate,
     labels: HashSet<SafetyLabelType>,
     agent_labels: HashSet<SafetyLabelType>,
 }
 
 impl CandidateBuilder {
     pub(crate) fn tweet_id(mut self, id: u64) -> Self {
-        self.candidate.tweet_id = id;
+        self.candidate.post.tweet_id = id;
         self
     }
 
@@ -387,28 +411,41 @@ impl CandidateBuilder {
     }
 
     pub(crate) fn with_author_user_label(mut self, label: AuthorLabel) -> Self {
-        self.candidate.author_labels.insert(label);
+        self.candidate.author.labels.insert(label);
         self
     }
 
     pub(crate) fn with_tweet_features(mut self, features: TweetFeatures) -> Self {
-        self.candidate.tweet_features = features;
+        self.candidate.post.tweet_features = features;
         self
     }
 
     pub(crate) fn with_author_features(mut self, features: AuthorFeatures) -> Self {
-        self.candidate.author_features = features;
+        self.candidate.author = UserEntity::new(
+            self.candidate.author.id,
+            features,
+            self.candidate.author.labels,
+        );
         self
     }
 
     pub(crate) fn with_edge(mut self, edge: Hydrator) -> Self {
         debug_assert!(edge.is_edge(), "{edge:?} is not an edge node");
-        self.candidate.edges = self.candidate.edges.with(edge);
+        if let Some(slot) = self.candidate.viewer_relationship.slot(edge) {
+            *slot = true;
+        } else {
+            self.candidate.post.edges = self.candidate.post.edges.with(edge);
+        }
+        debug_assert!(self.candidate.post.edges.iter().all(|node| self
+            .candidate
+            .viewer_relationship
+            .get(node)
+            .is_none()));
         self
     }
 
     pub(crate) fn with_media(mut self) -> Self {
-        self.candidate.tweet_features.media.has_media = true;
+        self.candidate.post.tweet_features.media.has_media = true;
         self
     }
 
@@ -416,19 +453,35 @@ impl CandidateBuilder {
         mut self,
         features: ConversationControlFeatures,
     ) -> Self {
-        self.candidate.conversation_control = Some(features);
+        self.candidate.post.conversation_control = Some(features);
         self
     }
 
     pub(crate) fn retweet_of(mut self, source_tweet_id: u64) -> Self {
-        self.candidate.source_tweet_id = Some(source_tweet_id);
+        self.candidate.post.source_tweet_id = Some(source_tweet_id);
         self
     }
 
-    pub(crate) fn build(self) -> HydratedTweetCandidate {
+    pub(crate) fn reply(mut self) -> Self {
+        self.candidate.post.is_reply = true;
+        self
+    }
+
+    pub(crate) fn with_reacted_to_post_labels(mut self, labels: &[SafetyLabelType]) -> Self {
+        self.candidate.post.reacted_to_post_safety_labels =
+            SafetyLabelMap::new(labels.iter().copied().collect());
+        self
+    }
+
+    pub(crate) fn with_protected_reacted_to_author(mut self) -> Self {
+        self.candidate.post.reacted_to_author_is_protected = true;
+        self
+    }
+
+    pub(crate) fn build(self) -> PostCandidate {
         let mut candidate = self.candidate;
         if !self.labels.is_empty() {
-            candidate.safety_labels = self.agent_labels.into_iter().fold(
+            candidate.post.safety_labels = self.agent_labels.into_iter().fold(
                 SafetyLabelMap::new(self.labels),
                 SafetyLabelMap::assigned_by_agent,
             );

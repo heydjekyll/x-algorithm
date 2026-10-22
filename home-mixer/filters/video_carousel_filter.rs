@@ -1,6 +1,10 @@
 use crate::models::candidate::PostCandidate;
 use crate::models::query::ScoredPostsQuery;
-use crate::params::RESULT_SIZE;
+use crate::params::{
+    EnableVideoCarouselAuthorDedupe, EnableVideoCarouselEmbeddingDedupe,
+    VideoCarouselEmbeddingDedupeThreshold, VideoCarouselImmersiveVqvWeight,
+    VideoCarouselSemanticIdDedupeLevels, VideoCarouselVideoOpenWeight, RESULT_SIZE,
+};
 use crate::util::video_carousel;
 use xai_candidate_pipeline::filter::{Filter, FilterResult};
 
@@ -19,8 +23,18 @@ impl Filter<ScoredPostsQuery, PostCandidate> for VideoCarouselFilter {
         let (removed, kept): (Vec<_>, Vec<_>) = candidates
             .into_iter()
             .partition(|candidate| candidate.video_carousel_extra);
+        let main_feed = &kept[..RESULT_SIZE.min(kept.len())];
         let _ = query.video_carousel.set(video_carousel::select_videos(
             kept.iter().skip(RESULT_SIZE).chain(&removed),
+            main_feed,
+            query.params.get(VideoCarouselVideoOpenWeight),
+            query.params.get(VideoCarouselImmersiveVqvWeight),
+            query.params.get(EnableVideoCarouselAuthorDedupe),
+            query.params.get(VideoCarouselSemanticIdDedupeLevels) as usize,
+            query
+                .params
+                .get(EnableVideoCarouselEmbeddingDedupe)
+                .then(|| query.params.get(VideoCarouselEmbeddingDedupeThreshold)),
         ));
         FilterResult { kept, removed }
     }

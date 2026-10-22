@@ -1,29 +1,30 @@
 use crate::config::ENV_APP_ENV;
-use crate::filter::FilterTweets;
-use crate::models::TweetId;
-use crate::params::{ClientSwitches, CountryList, CountryLists, SwitchFiles};
+use crate::evaluate_tweets::evaluate_tweets_request;
+pub use crate::hydration::sources::test_users_metadata;
+use crate::models::viewer::Client;
+use crate::models::{PlacedCandidate, RawCandidate, TweetId};
+use crate::params::{ClientSwitches, CountryList, CountryLists, Experiments, SwitchFiles};
+use crate::post_evaluator::PostEvaluator;
+use crate::result_label::Class;
 use crate::rules::RuleEngine;
-use crate::server_deps::{CLIENT_INIT_RETRY_BUDGET, prod_sources};
+use crate::server_deps::{CLIENT_INIT_RETRY_BUDGET, CacheWarming, prod_sources};
 use crate::staging::recording::{Recorder, Recording};
 use crate::staging::reference::ENV_IMAGE;
-use crate::staging::reference::tweetypie::{self, Class, Client, get_tweet_fields};
-use crate::staging::reference_compare::resolve_build_sha;
-use crate::staging::replay_corpus::{Case, Expected, Fixtures, evaluate};
+use crate::staging::reference::tweetypie::{self, TpResult, get_tweet_fields};
+use crate::staging::reference::vf_service::resolve_build_sha;
+use crate::staging::replay_corpus::{Case, Expected, Fixtures, QuoteContext, evaluate, placement};
 use anyhow::{Context, bail};
 use arc_swap::ArcSwap;
 use futures::future::join;
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::env;
 use std::io::{BufRead, stdin};
 use std::path::Path;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::time::Instant;
-use tonic::metadata::{MetadataMap, MetadataValue};
 use xai_build_version::current_build_information;
-
-const TEST_USERS_DTAB: &str = "/s/gizmoduck/test-users-permanent=>/s/gizmoduck/gizmoduck";
 
 pub const FIXTURES_IN_IMAGE: &str = "/config/replay_corpus/fixtures.json";
 
@@ -62,6 +63,8 @@ impl Captured {
 struct CaptureTweet {
     id: u64,
     #[serde(default)]
+    quote_context: Option<QuoteContext>,
+    #[serde(default)]
     tags: Vec<String>,
 }
 
@@ -79,20 +82,20 @@ pub async fn run(datacenter: &str, test_users: bool, fixtures: &Path) -> anyhow:
         datacenter,
         init_deadline,
         false,
-        None,
-        None,
         metadata.as_ref(),
+        CacheWarming::Off,
     )
     .await;
-    let feature_switches = SwitchFiles::beside(&crate::config::fs_path())
+    let feature_switches = SwitchFiles::beside(&crate::config::fs_path(), Experiments::none())
         .load(None)
         .context("feature switch files")?;
     let country_lists = Arc::new(CountryLists::starting_at_default());
     country_lists.refresh(&feature_switches);
     let client_switches = ClientSwitches::new(Arc::new(ArcSwap::from_pointee(feature_switches)));
-    let filter_tweets = FilterTweets::new(
+    let post_evaluator = PostEvaluator::new(
         Arc::new(sources.observed(Arc::clone(&recorder))),
         RuleEngine::with_country_lists(Arc::clone(&country_lists)),
+        Arc::default(),
     );
     let fixtures = Fixtures::load(fixtures)?;
     let tweetypie = tweetypie::connect(init_deadline, metadata.as_ref()).await;
@@ -129,28 +132,55 @@ pub async fn run(datacenter: &str, test_users: bool, fixtures: &Path) -> anyhow:
             );
             continue;
         }
+        let standalone: Vec<TweetId> = request
+            .tweets
+            .iter()
+            .filter(|tweet| tweet.quote_context.is_none())
+            .map(|tweet| TweetId(tweet.id))
+            .collect();
+        let orphans: Vec<u64> = request
+            .tweets
+            .iter()
+            .filter_map(|tweet| tweet.quote_context)
+            .map(|quote| quote.outer_tweet_id)
+            .filter(|&outer| !standalone.contains(&TweetId(outer)))
+            .collect();
+        if !orphans.is_empty() {
+            eprintln!(
+                "capture: skipped {}: the outers {orphans:?} of its quote entries are not standalone entries",
+                request.id
+            );
+            continue;
+        }
         let client = request
             .client
             .context(request.viewer_id, request.country_code.as_deref());
-        let client_capability = client_switches.resolve(
+        let vf_request = evaluate_tweets_request(
+            &client_switches,
             Some(&client),
             request.viewer_id,
-            request.country_code.as_deref(),
+            tweetypie::SAFETY_LEVEL,
+            request
+                .tweets
+                .iter()
+                .map(|tweet| PlacedCandidate {
+                    candidate: RawCandidate {
+                        tweet_id: TweetId(tweet.id),
+                        request_author_id: None,
+                    },
+                    placement: placement(tweet.quote_context),
+                })
+                .collect(),
         );
-        let tweet_ids: Vec<u64> = request.tweets.iter().map(|tweet| tweet.id).collect();
-        let ids: Vec<TweetId> = tweet_ids.iter().copied().map(TweetId).collect();
+        let country_code = vf_request.country_code.clone();
+        let client_capability = vf_request.client_capability;
         recorder.take();
         let (vf, tp) = join(
-            evaluate(
-                &filter_tweets,
-                request.viewer_id,
-                request.country_code.clone(),
-                client_capability,
-                &tweet_ids,
-            ),
-            get_tweet_fields(&tweetypie, &client, &ids),
+            evaluate(&post_evaluator, vf_request),
+            get_tweet_fields(&tweetypie, &client, &standalone),
         )
         .await;
+        let tp: HashMap<TweetId, TpResult> = standalone.into_iter().zip(tp).collect();
         let recording = recorder.take();
         let unsuccessful = recording.unsuccessful();
         if !unsuccessful.is_empty() {
@@ -177,16 +207,29 @@ pub async fn run(datacenter: &str, test_users: bool, fixtures: &Path) -> anyhow:
         let tweets: Vec<Expected> = request
             .tweets
             .into_iter()
-            .zip(tp)
-            .filter_map(|(tweet, tp)| {
-                let vf = vf.iter().find(|vf| vf.tweet_id == tweet.id)?;
+            .filter_map(|tweet| {
+                let tp = match tweet.quote_context {
+                    None => tp.get(&TweetId(tweet.id))?.clone(),
+                    Some(quote) => tp.get(&TweetId(quote.outer_tweet_id))?.inner_quoted(),
+                };
+                let vf = vf.iter().find(|vf| {
+                    vf.tweet_id == tweet.id && vf.placement == placement(tweet.quote_context)
+                })?;
                 let failed = <&str>::from(Class::Failed);
+                if tp.label.0 == <&str>::from(Class::Missing) {
+                    eprintln!(
+                        "capture: {}: dropped quote entry {}: its outer's answer has no quotedTweetResult",
+                        request.id, tweet.id
+                    );
+                    return None;
+                }
                 (vf.label.0 != failed && tp.label.0 != failed).then(|| Expected {
                     tweet_id: tweet.id,
+                    quote_context: tweet.quote_context,
                     tags: tweet.tags,
                     tweetypie: tp.label,
                     vf: vf.label.clone(),
-                    vf_rule: vf.rule.map(str::to_owned),
+                    vf_rule: vf.rule.map(|(_, rule)| rule.to_owned()),
                 })
             })
             .collect();
@@ -205,7 +248,7 @@ pub async fn run(datacenter: &str, test_users: bool, fixtures: &Path) -> anyhow:
                 .map_or(0, |since| since.as_secs()),
             build: build.clone(),
             viewer_id: request.viewer_id,
-            country_code: request.country_code,
+            country_code,
             client: request.client,
             client_capability,
             tweets,
@@ -219,12 +262,6 @@ pub async fn run(datacenter: &str, test_users: bool, fixtures: &Path) -> anyhow:
     Ok(())
 }
 
-pub fn test_users_metadata() -> MetadataMap {
-    let mut metadata = MetadataMap::new();
-    metadata.insert("dtab-local", MetadataValue::from_static(TEST_USERS_DTAB));
-    metadata
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -236,7 +273,7 @@ mod tests {
     #[test]
     fn a_captured_line_is_its_case_beside_the_shared_answers() {
         let recorder = Arc::new(Recorder::default());
-        recorder.answered::<exchange::TesPureCore>(iter::once((1, Hydrated::NotFound)));
+        recorder.answered::<exchange::TesPureCoreData>(iter::once((1, Hydrated::NotFound)));
         recorder.answered::<exchange::GizmoduckViewer>(iter::once((50, Hydrated::NotFound)));
         let case = Case {
             id: "a".to_owned(),

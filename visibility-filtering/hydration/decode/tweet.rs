@@ -1,5 +1,7 @@
 use crate::hydration::fallback_cache::{Column, FallbackCache};
-use crate::models::{AuthorId, MediaFeature, NsfwFeature, PureCore, TweetFeatures, TweetId};
+use crate::models::{
+    AuthorId, MediaFeature, NsfwFeature, PureCore, ReactionContext, ReplyTo, TweetFeatures, TweetId,
+};
 use std::num::NonZeroU64;
 use xai_core_entities::entities::{EditControl, EditControlInitial, PureCoreData, TakedownReason};
 
@@ -109,15 +111,16 @@ pub(crate) struct CachedTweetRow {
     latest_edit_tweet_id: Option<NonZeroU64>,
     exclusive_conversation_author_id: Option<NonZeroU64>,
     article_id: Option<NonZeroU64>,
-    restrictions: Option<Box<Restrictions>>,
+    sparse: Option<Box<Sparse>>,
 }
 
 #[derive(Clone, Default)]
-struct Restrictions {
+struct Sparse {
     geo_allow_list: Vec<String>,
     geo_deny_list: Vec<String>,
     takedown_reasons: Vec<TakedownReason>,
     narrowcast_place_id: Option<u64>,
+    reaction_context: Option<ReactionContext>,
 }
 
 impl CachedTweetRow {
@@ -140,11 +143,13 @@ impl CachedTweetRow {
             exclusive_conversation_author_id,
             article_id,
             narrowcast_place_id,
+            reaction_context,
         } = tweet;
-        let restricted = !(geo_allow_list.is_empty()
+        let is_sparse = !(geo_allow_list.is_empty()
             && geo_deny_list.is_empty()
             && takedown_reasons.is_empty()
-            && narrowcast_place_id.is_none());
+            && narrowcast_place_id.is_none()
+            && reaction_context.is_none());
         Self {
             has_media: *has_media,
             has_uploaded_media: *has_uploaded_media,
@@ -158,24 +163,26 @@ impl CachedTweetRow {
             latest_edit_tweet_id: tweet.latest_edit_tweet_id().map(stored_id),
             exclusive_conversation_author_id: exclusive_conversation_author_id.map(stored_id),
             article_id: *article_id,
-            restrictions: restricted.then(|| {
-                Box::new(Restrictions {
+            sparse: is_sparse.then(|| {
+                Box::new(Sparse {
                     geo_allow_list: geo_allow_list.clone(),
                     geo_deny_list: geo_deny_list.clone(),
                     takedown_reasons: takedown_reasons.clone(),
                     narrowcast_place_id: *narrowcast_place_id,
+                    reaction_context: *reaction_context,
                 })
             }),
         }
     }
 
     fn features(&self) -> TweetFeatures {
-        let Restrictions {
+        let Sparse {
             geo_allow_list,
             geo_deny_list,
             takedown_reasons,
             narrowcast_place_id,
-        } = self.restrictions.as_deref().cloned().unwrap_or_default();
+            reaction_context,
+        } = self.sparse.as_deref().cloned().unwrap_or_default();
         TweetFeatures {
             media: MediaFeature {
                 has_media: self.has_media,
@@ -203,6 +210,7 @@ impl CachedTweetRow {
             exclusive_conversation_author_id: self.exclusive_conversation_author_id.map(read_id),
             article_id: self.article_id,
             narrowcast_place_id,
+            reaction_context,
         }
     }
 }
@@ -224,20 +232,29 @@ pub(crate) fn pure_core(core: &PureCoreData) -> PureCore {
         author_id: AuthorId(core.author_id),
         source_tweet_id: core.source_tweet_id.map(TweetId),
         source_author_id: core.source_user_id.filter(|&id| id != 0).map(AuthorId),
-        direct_reply_root_author_id: direct_reply_root_author(core),
+        reply_to: reply_to(core),
     }
 }
 
-fn direct_reply_root_author(core: &PureCoreData) -> Option<AuthorId> {
-    core.in_reply_to_tweet_id
-        .filter(|&replied_to| core.conversation_id == Some(replied_to))
-        .and(core.in_reply_to_user_id)
-        .map(AuthorId)
+fn reply_to(core: &PureCoreData) -> Option<ReplyTo> {
+    let conversation_id = TweetId(core.conversation_id?);
+    let parent_id = TweetId(core.in_reply_to_tweet_id?);
+    if parent_id != conversation_id {
+        return Some(ReplyTo::Nested {
+            conversation_id,
+            parent_id,
+        });
+    }
+    Some(ReplyTo::Root {
+        conversation_id,
+        root_author_id: AuthorId(core.in_reply_to_user_id?),
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::models::Placement;
     use crate::rules::fixtures::{candidate, dropped, logged_out_viewer};
     use crate::rules::{RuleEngine, SafetyLevel};
     use xai_core_entities::entities::EditControlEdit;
@@ -257,6 +274,36 @@ mod tests {
     }
 
     #[test]
+    fn a_direct_reply_names_its_root_author_and_a_nested_one_its_parent() {
+        let root = Some(ReplyTo::Root {
+            conversation_id: TweetId(100),
+            root_author_id: AuthorId(30),
+        });
+        let nested = Some(ReplyTo::Nested {
+            conversation_id: TweetId(100),
+            parent_id: TweetId(101),
+        });
+        for (ids, expected) in [
+            ((Some(100), Some(100), Some(30)), root),
+            ((Some(100), Some(100), None), None),
+            ((Some(100), Some(101), Some(30)), nested),
+            ((Some(100), Some(101), None), nested),
+            ((None, Some(101), Some(30)), None),
+            ((Some(100), None, Some(30)), None),
+        ] {
+            let (conversation_id, in_reply_to_tweet_id, in_reply_to_user_id) = ids;
+            let core = PureCoreData {
+                author_id: 10,
+                conversation_id,
+                in_reply_to_tweet_id,
+                in_reply_to_user_id,
+                ..Default::default()
+            };
+            assert_eq!(pure_core(&core).reply_to, expected, "{ids:?}");
+        }
+    }
+
+    #[test]
     fn a_cached_row_fits_in_56_bytes_and_keeps_a_circle_list_id_of_zero() {
         let circle = TweetFeatures {
             trusted_friends_list_id: Some(0),
@@ -267,12 +314,14 @@ mod tests {
     }
 
     #[test]
-    fn a_cached_row_keeps_the_place_of_a_local_post_with_no_other_restriction() {
+    fn a_cached_row_keeps_a_place_or_a_reaction_context_set_alone() {
         let local = TweetFeatures {
             narrowcast_place_id: Some(0xa000_0000_0000_0001),
             ..Default::default()
         };
+        let reaction = crate::scenario::reaction_to(9, 10);
         assert_eq!(CachedTweetRow::new(&local).features(), local);
+        assert_eq!(CachedTweetRow::new(&reaction).features(), reaction);
     }
 
     #[test]
@@ -307,7 +356,12 @@ mod tests {
             let post = candidate().with_tweet_features(cached).build();
             assert_eq!(
                 engine
-                    .evaluate(SafetyLevel::TimelineHome, &logged_out_viewer(), &post)
+                    .evaluate(
+                        SafetyLevel::TimelineHome,
+                        &logged_out_viewer(),
+                        &post,
+                        Placement::Standalone,
+                    )
                     .into_verdict(),
                 expected
             );
@@ -342,6 +396,10 @@ mod tests {
             exclusive_conversation_author_id: Some(7),
             article_id: NonZeroU64::new(8),
             narrowcast_place_id: Some(0xa000_0000_0000_0001),
+            reaction_context: Some(ReactionContext {
+                reacted_to_post_id: 9,
+                reacted_to_user_id: 10,
+            }),
         };
 
         let cached = CachedTweetRow::new(&tweet).features();

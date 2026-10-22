@@ -1,10 +1,11 @@
-use crate::limited_actions_copy::{Prompt, PromptKind, LEARN_MORE_PLACEHOLDER};
 use crate::models::{
     Decided, DropReason, FosnrReason, LimitedEngagement, LimitedEngagementReason,
     MediaInterstitial, MediaRestriction, Notice, NsfwViewerDropReason, TombstoneReason, Verdict,
     Withholding,
 };
+use crate::params::limited_actions_copy::{Prompt, PromptKind, LEARN_MORE_PLACEHOLDER};
 use crate::params::{LimitedActionType, LimitedActionsPolicies};
+use crate::quote::Rerendered;
 use crate::rules::SafetyLevel;
 use xai_visibility_filtering::models::FilteredReason;
 use xai_visibility_filtering_proto as vf_pb;
@@ -108,6 +109,10 @@ pub(crate) fn thrift_action(
             })
         }
     }
+}
+
+pub(crate) fn rerendered_state(rerendered: &Rerendered) -> TweetFieldsResultState {
+    TweetFieldsResultState::Filtered(TweetFieldsResultFiltered::new(rerendered.reason.clone()))
 }
 
 pub(crate) fn thrift_result_state(
@@ -386,6 +391,7 @@ fn drop_reason(reason: &DropReason, level: SafetyLevel) -> Option<action::DropRe
 
 fn tombstone_reason(reason: TombstoneReason) -> action::TombstoneReason {
     match reason {
+        TombstoneReason::Bounced => action::TombstoneReason::BOUNCED,
         TombstoneReason::SensitiveViewerAgeVerification => {
             action::TombstoneReason::SENSITIVE_VIEWER_AGE_VERIFICATION
         }
@@ -549,11 +555,16 @@ pub(crate) fn decided_rows(
     notice.into_iter().chain(first).chain(second)
 }
 
+pub(crate) fn decided_by(verdict: &Verdict) -> Option<&'static str> {
+    decided_rows(verdict).next().map(|(rule, _)| rule)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::metrics::Rpc;
     use crate::rules::fixtures::{appealed, limited_for, noticed};
-    use crate::rules::metrics::Rpc;
+    use crate::rules::RuleId;
     use vf_pb::action::Kind;
     use xai_visibility_filtering::graphql_results::resolve_blurred_image_interstitial;
     use xai_visibility_filtering::models::{KeywordMatch, SafetyResult};
@@ -570,6 +581,7 @@ mod tests {
     fn dropped(reason: FilteredReason) -> Verdict {
         Verdict::Withheld(Decided {
             value: Withholding::Drop(DropReason::Legacy(reason)),
+            id: RuleId::FilterAll,
             by: "rule",
         })
     }
@@ -577,8 +589,32 @@ mod tests {
     fn tombstoned(reason: TombstoneReason) -> Verdict {
         Verdict::Withheld(Decided {
             value: Withholding::Tombstone(reason),
+            id: RuleId::FilterAll,
             by: "rule",
         })
+    }
+
+    #[test]
+    fn decided_by_names_the_deciding_rule_or_why_the_rules_never_ran() {
+        use crate::hydration::{Hydrator, Hydrators, Lookup};
+        use crate::models::Evaluation;
+        use crate::rules::fixtures::allow;
+        let suspended = dropped(FilteredReason::AuthorIsSuspended);
+        for (evaluation, rule) in [
+            (Evaluation::complete(allow()), None),
+            (Evaluation::complete(suspended.clone()), Some("rule")),
+            (
+                Evaluation::Partial {
+                    verdict: suspended,
+                    fail_open_defaults: Hydrators::of(Hydrator::Follows),
+                },
+                Some("rule"),
+            ),
+            (Evaluation::NotFound(Lookup::Author), Some("not_found")),
+            (Evaluation::Failed(Lookup::Tweet), Some("lookup_failed")),
+        ] {
+            assert_eq!(decided_by(evaluation.verdict()), rule, "{evaluation:?}");
+        }
     }
 
     fn blur_with(
@@ -591,6 +627,7 @@ mod tests {
                 reason,
                 prompt,
             }),
+            id: RuleId::FilterAll,
             by: "blur_rule",
         }
     }
@@ -602,6 +639,7 @@ mod tests {
     fn legacy_interstitial() -> Decided<MediaRestriction> {
         Decided {
             value: MediaRestriction::NsfwInterstitial,
+            id: RuleId::FilterAll,
             by: "fallback_rule",
         }
     }
@@ -651,6 +689,7 @@ mod tests {
     fn limit() -> Decided<LimitedEngagement> {
         Decided {
             value: LimitedEngagement::new(LimitedEngagementReason::ConversationControl),
+            id: RuleId::FilterAll,
             by: "limit_rule",
         }
     }
@@ -678,7 +717,7 @@ mod tests {
         rows: &'static [(&'static str, &'static str)],
     }
 
-    fn verdict_cases() -> [(Verdict, Projected); 18] {
+    fn verdict_cases() -> [(Verdict, Projected); 19] {
         use action::LimitedActionType as T;
         let proto_drop = Kind::Drop(vf_pb::DropReason {});
         let tombstone = |reason, code| {
@@ -700,6 +739,7 @@ mod tests {
             (
                 Verdict::Withheld(Decided {
                     value: Withholding::Drop(DropReason::NsfwViewer(reason)),
+                    id: RuleId::FilterAll,
                     by: "rule",
                 }),
                 Projected {
@@ -744,6 +784,7 @@ mod tests {
                 NsfwViewerDropReason::LoggedOut,
                 action::DropReason::NsfwLoggedOut(true),
             ),
+            tombstone(TombstoneReason::Bounced, 2),
             tombstone(TombstoneReason::SensitiveViewerAgeVerification, 30),
             tombstone(TombstoneReason::UpdateAppIos, 31),
             tombstone(TombstoneReason::UpdateAppAndroid, 32),
@@ -1144,10 +1185,12 @@ mod tests {
         };
         let limited = Decided {
             value: LimitedEngagement::new(LimitedEngagementReason::ConversationControl),
+            id: RuleId::FilterAll,
             by: "limit_rule",
         };
         let nsfw = Decided {
             value: MediaRestriction::NsfwInterstitial,
+            id: RuleId::FilterAll,
             by: "nsfw_rule",
         };
         let mut cases = vec![
@@ -1178,6 +1221,7 @@ mod tests {
             dropped(FilteredReason::ExclusiveTweet),
             Verdict::Withheld(Decided {
                 value: Withholding::Drop(DropReason::NsfwViewer(NsfwViewerDropReason::IsUnderage)),
+                id: RuleId::FilterAll,
                 by: "rule",
             }),
             tombstoned(TombstoneReason::LocalRegulations),

@@ -1,22 +1,140 @@
-use crate::filter::{FilterOutcome, FilterRequest, FilterTweets, HydratedRequest};
 use crate::hydration::Hydrators;
+use crate::metrics as ft_metrics;
+use crate::metrics::Rpc;
 use crate::models::{
-    Decided, Evaluation, HydratedTweetCandidate, TweetFeatures, TweetId, Verdict, Withholding,
+    Decided, Evaluation, EvaluationKey, PlacedCandidate, TweetId, Verdict, Withholding,
 };
-use crate::rules::metrics as ft_metrics;
-use std::collections::hash_map::Entry;
+use crate::post_evaluator::{
+    HydratedRequest, PostBatch, PostEvaluation, PostEvaluator, PostObserver,
+};
+use crate::rules::{NoTrace, PolicyTrace};
 use std::collections::{HashMap, HashSet};
 
 const RETWEET_SOURCES: &str = "evaluate_tweets_retweet_sources";
 
 pub(crate) async fn evaluate_merging_sources(
-    filter_tweets: &FilterTweets,
-    request: FilterRequest,
-) -> Vec<FilterOutcome> {
-    let hydrated = filter_tweets.hydrate_with_retweet_sources(request).await;
-    let (in_batch, fetched) = source_ids(&hydrated);
+    post_evaluator: &PostEvaluator,
+    request: PostBatch,
+) -> Vec<PostEvaluation> {
+    let hydrated = post_evaluator
+        .hydrate(request, Some(Rpc::EvaluateTweets))
+        .await;
+    without_selections(merge_sources(post_evaluator, &hydrated, &mut NoTrace))
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MergeSelection {
+    RequestedOnly,
+    RequestedIncomplete,
+    SourceIncomplete,
+    SourceWithheld,
+    RequestedWithheld,
+    SourceRestrictions,
+    RequestedRestrictions,
+}
+
+#[derive(Default)]
+pub(crate) struct Traced {
+    pub(crate) policies: HashMap<EvaluationKey, PolicyTrace>,
+    pub(crate) selections: HashMap<EvaluationKey, MergeSelection>,
+}
+
+pub(crate) async fn hydrate_and_trace(
+    post_evaluator: &PostEvaluator,
+    request: PostBatch,
+) -> (HydratedRequest, Vec<PostEvaluation>, Traced) {
+    let rpc = request.rpc;
+    let mut traced = Traced::default();
+    let (hydrated, selected) =
+        hydrate_and_select(post_evaluator, request, &mut traced.policies).await;
+    let outcomes = selected
+        .into_iter()
+        .map(|(outcome, selection)| {
+            traced.selections.insert(outcome.key(), selection);
+            outcome
+        })
+        .collect();
+    if rpc == Rpc::EvaluateTweets {
+        trace_unmerged_sources(post_evaluator, &hydrated, &mut traced);
+    }
+    (hydrated, outcomes, traced)
+}
+
+#[cfg(test)]
+pub(crate) async fn hydrate_and_evaluate(
+    post_evaluator: &PostEvaluator,
+    request: PostBatch,
+) -> (HydratedRequest, Vec<PostEvaluation>) {
+    let (hydrated, selected) = hydrate_and_select(post_evaluator, request, &mut NoTrace).await;
+    (hydrated, without_selections(selected))
+}
+
+async fn hydrate_and_select<O: PostObserver>(
+    post_evaluator: &PostEvaluator,
+    request: PostBatch,
+    observer: &mut O,
+) -> (HydratedRequest, Vec<(PostEvaluation, MergeSelection)>) {
+    match request.rpc {
+        Rpc::FilterTweets => {
+            let hydrated = post_evaluator.hydrate(request, None).await;
+            let selected = post_evaluator
+                .evaluate_in_request_order(&hydrated, observer)
+                .into_iter()
+                .map(|outcome| (outcome, MergeSelection::RequestedOnly))
+                .collect();
+            (hydrated, selected)
+        }
+        Rpc::EvaluateTweets => {
+            let hydrated = post_evaluator
+                .hydrate(request, Some(Rpc::EvaluateTweets))
+                .await;
+            let selected = merge_sources(post_evaluator, &hydrated, observer);
+            (hydrated, selected)
+        }
+    }
+}
+
+fn without_selections(selected: Vec<(PostEvaluation, MergeSelection)>) -> Vec<PostEvaluation> {
+    selected.into_iter().map(|(outcome, _)| outcome).collect()
+}
+
+fn trace_unmerged_sources(
+    post_evaluator: &PostEvaluator,
+    hydrated: &HydratedRequest,
+    traced: &mut Traced,
+) {
+    let hydration = hydrated.hydration();
+    let unmerged: Vec<EvaluationKey> = hydrated
+        .requested_ids()
+        .filter_map(|tweet_id| hydration.tweet(tweet_id)?.source_tweet_id())
+        .filter(|&source_id| {
+            hydration
+                .tweet(source_id)
+                .is_some_and(|source| source.candidate().is_some())
+        })
+        .map(EvaluationKey::retweet_source)
+        .filter(|key| !traced.policies.contains_key(key))
+        .collect();
+    if !unmerged.is_empty() {
+        post_evaluator.trace(hydrated, unmerged, &mut traced.policies);
+    }
+}
+
+fn merge_sources<O: PostObserver>(
+    post_evaluator: &PostEvaluator,
+    hydrated: &HydratedRequest,
+    observer: &mut O,
+) -> Vec<(PostEvaluation, MergeSelection)> {
+    let (in_batch, fetched) = source_ids(hydrated);
     if in_batch.is_empty() && fetched.is_empty() {
-        return filter_tweets.evaluate_in_request_order(&hydrated);
+        return post_evaluator
+            .evaluate_in_request_order(hydrated, observer)
+            .into_iter()
+            .map(|outcome| {
+                let selection = requested_selection(&outcome.evaluation);
+                (outcome, selection)
+            })
+            .collect();
     }
     ft_metrics::incr_nonzero(
         RETWEET_SOURCES,
@@ -28,51 +146,104 @@ pub(crate) async fn evaluate_merging_sources(
         &[("outcome", "fetched")],
         fetched.len() as u64,
     );
-    let copied_retweets = copy_from_sources(&hydrated);
-    let mut outcomes = filter_tweets.evaluate(
-        &hydrated,
-        hydrated.requested_ids().chain(fetched.iter().copied()),
-        &copied_retweets,
-    );
-    let mut sources: HashMap<TweetId, Evaluation> = in_batch
-        .iter()
-        .filter_map(|&source_id| Some((source_id, outcomes.get(&source_id)?.evaluation.clone())))
+    let source_ids = || in_batch.iter().chain(&fetched).copied();
+    let keys = hydrated
+        .candidates()
+        .map(PlacedCandidate::key)
+        .chain(source_ids().map(EvaluationKey::retweet_source));
+    let mut outcomes = post_evaluator.evaluate(hydrated, keys, observer);
+    let sources: HashMap<TweetId, Evaluation> = source_ids()
+        .filter_map(|source_id| {
+            let source = outcomes.remove(&EvaluationKey::retweet_source(source_id))?;
+            Some((source_id, source.evaluation))
+        })
         .collect();
-    sources.extend(fetched.iter().filter_map(|source_id| {
-        let source = outcomes.remove(source_id)?;
-        Some((source.tweet_id, source.evaluation))
-    }));
-    let mut merged: Vec<FilterOutcome> = Vec::with_capacity(hydrated.requested_ids().len());
-    for tweet_id in hydrated.requested_ids() {
-        let outcome = match outcomes.remove(&tweet_id) {
+    let mut merged: Vec<(PostEvaluation, MergeSelection)> =
+        Vec::with_capacity(hydrated.candidates().len());
+    for candidate in hydrated.candidates() {
+        let key = candidate.key();
+        let selected = match outcomes.remove(&key) {
             Some(outcome) => merge_source(outcome, &sources),
-            None => match merged.iter().rfind(|outcome| outcome.tweet_id == tweet_id) {
-                Some(outcome) => outcome.clone(),
+            None => match merged.iter().rfind(|(prior, _)| prior.key() == key) {
+                Some(selected) => selected.clone(),
                 None => continue,
             },
         };
-        merged.push(outcome);
+        merged.push(selected);
     }
     merged
 }
 
-fn merge_source(outcome: FilterOutcome, sources: &HashMap<TweetId, Evaluation>) -> FilterOutcome {
-    let evaluation = match (outcome.evaluation, outcome.source_tweet_id) {
-        (Evaluation::Complete { verdict }, Some(source_id)) => match sources.get(&source_id) {
-            Some(Evaluation::Complete { verdict: source }) => Evaluation::Complete {
-                verdict: merge_verdict(verdict, source),
-            },
-            Some(Evaluation::Partial { .. } | Evaluation::NotFound(_) | Evaluation::Failed(_))
-            | None => Evaluation::Partial {
+fn merge_source(
+    outcome: PostEvaluation,
+    sources: &HashMap<TweetId, Evaluation>,
+) -> (PostEvaluation, MergeSelection) {
+    let (evaluation, selection) = match (outcome.evaluation, outcome.source_tweet_id) {
+        (
+            Evaluation::Complete {
                 verdict,
-                fail_open_defaults: Hydrators::empty(),
+                fail_open_defaults,
             },
-        },
-        (evaluation, _) => evaluation,
+            Some(source_id),
+        ) => {
+            let source = sources.get(&source_id);
+            let fail_open_defaults = fail_open_defaults
+                .union(source.map_or(Hydrators::empty(), Evaluation::fail_open_defaults));
+            match source {
+                Some(Evaluation::Complete {
+                    verdict: source, ..
+                }) => {
+                    let selection = merge_selection(&verdict, source);
+                    let verdict = match selection {
+                        MergeSelection::SourceWithheld | MergeSelection::SourceRestrictions => {
+                            source.clone()
+                        }
+                        MergeSelection::RequestedOnly
+                        | MergeSelection::RequestedIncomplete
+                        | MergeSelection::SourceIncomplete
+                        | MergeSelection::RequestedWithheld
+                        | MergeSelection::RequestedRestrictions => verdict,
+                    };
+                    (
+                        Evaluation::Complete {
+                            verdict,
+                            fail_open_defaults,
+                        },
+                        selection,
+                    )
+                }
+                Some(
+                    Evaluation::Partial { .. } | Evaluation::NotFound(_) | Evaluation::Failed(_),
+                )
+                | None => (
+                    Evaluation::Partial {
+                        verdict,
+                        fail_open_defaults,
+                    },
+                    MergeSelection::SourceIncomplete,
+                ),
+            }
+        }
+        (evaluation, _) => {
+            let selection = requested_selection(&evaluation);
+            (evaluation, selection)
+        }
     };
-    FilterOutcome {
-        evaluation,
-        ..outcome
+    (
+        PostEvaluation {
+            evaluation,
+            ..outcome
+        },
+        selection,
+    )
+}
+
+fn requested_selection(evaluation: &Evaluation) -> MergeSelection {
+    match evaluation {
+        Evaluation::Partial { .. } => MergeSelection::RequestedIncomplete,
+        Evaluation::Complete { .. } | Evaluation::NotFound(_) | Evaluation::Failed(_) => {
+            MergeSelection::RequestedOnly
+        }
     }
 }
 
@@ -91,50 +262,8 @@ fn source_ids(hydrated: &HydratedRequest) -> (HashSet<TweetId>, HashSet<TweetId>
         .partition(|source_id| requested.contains(source_id))
 }
 
-#[derive(Clone, Copy)]
-struct CopiedFromSource {
-    has_media: bool,
-}
-
-impl CopiedFromSource {
-    fn of(source: &TweetFeatures) -> Self {
-        Self {
-            has_media: source.media.has_uploaded_media,
-        }
-    }
-
-    fn is_on(self, retweet: &TweetFeatures) -> bool {
-        retweet.media.has_media == self.has_media
-    }
-
-    fn copy_onto(self, retweet: &mut TweetFeatures) {
-        retweet.media.has_media = self.has_media;
-    }
-}
-
-fn copy_from_sources(hydrated: &HydratedRequest) -> HashMap<TweetId, HydratedTweetCandidate> {
-    let hydration = hydrated.hydration();
-    let source = |source_id| hydration.tweet(source_id)?.candidate();
-    let mut copied_retweets = HashMap::new();
-    for tweet_id in hydrated.requested_ids() {
-        if let Entry::Vacant(entry) = copied_retweets.entry(tweet_id)
-            && let Some(retweet) = hydration.tweet(tweet_id)
-            && let Some(source) = retweet.source_tweet_id().and_then(source)
-            && let Some(candidate) = retweet.candidate()
-        {
-            let copied = CopiedFromSource::of(&source.tweet_features);
-            if !copied.is_on(&candidate.tweet_features) {
-                let mut candidate = candidate.clone();
-                copied.copy_onto(&mut candidate.tweet_features);
-                entry.insert(candidate);
-            }
-        }
-    }
-    copied_retweets
-}
-
-fn merge_verdict(retweet: Verdict, source: &Verdict) -> Verdict {
-    match (&retweet, source) {
+fn merge_selection(retweet: &Verdict, source: &Verdict) -> MergeSelection {
+    match (retweet, source) {
         (
             Verdict::Withheld(Decided {
                 value: Withholding::Drop(_),
@@ -144,9 +273,9 @@ fn merge_verdict(retweet: Verdict, source: &Verdict) -> Verdict {
                 value: Withholding::Tombstone(_),
                 ..
             }),
-        ) => retweet,
-        (_, Verdict::Withheld(_)) => source.clone(),
-        (Verdict::Withheld(_), _) => retweet,
+        ) => MergeSelection::RequestedWithheld,
+        (_, Verdict::Withheld(_)) => MergeSelection::SourceWithheld,
+        (Verdict::Withheld(_), _) => MergeSelection::RequestedWithheld,
         (
             Verdict::Shown {
                 notice: None,
@@ -154,8 +283,8 @@ fn merge_verdict(retweet: Verdict, source: &Verdict) -> Verdict {
                 engagement: None,
             },
             _,
-        ) => source.clone(),
-        _ => retweet,
+        ) => MergeSelection::SourceRestrictions,
+        _ => MergeSelection::RequestedRestrictions,
     }
 }
 
@@ -163,19 +292,18 @@ fn merge_verdict(retweet: Verdict, source: &Verdict) -> Verdict {
 mod tests {
     use super::*;
     use crate::clients::socialgraph_client::{EdgeDirection, Graph};
-    use crate::hydration::Lookup;
-    use crate::hydration::plan::Source;
-    use crate::hydration::sources::{InMemorySources, control, suspended};
+    use crate::hydration::inventory::Source;
+    use crate::hydration::sources::{control, suspended, InMemorySources};
+    use crate::hydration::{Hydrator, Lookup};
+    use crate::metrics::Rpc;
     use crate::models::{
         ClientCapability, DropReason, LimitedEngagement, LimitedEngagementReason, MediaFeature,
-        MediaInterstitial, MediaRestriction, NsfwFeature, RawCandidate, SafetyLabelType,
+        MediaInterstitial, MediaRestriction, NsfwFeature, Placement, RawCandidate, SafetyLabelType,
         TombstoneReason, TweetFeatures,
     };
     use crate::rules::fixtures::{allow, legacy_interstitial, limited, noticed};
-    use crate::rules::metrics::Rpc;
-    use crate::rules::{RuleEngine, SafetyLevel};
-    use std::num::NonZeroU64;
-    use std::sync::Arc;
+    use crate::rules::{RuleId, SafetyLevel};
+    use crate::scenario::{raw, Scenario};
     use std::time::Duration;
     use xai_core_entities::entities::{ConversationControlArm, PureCoreData};
     use xai_visibility_filtering::models::FilteredReason;
@@ -183,13 +311,15 @@ mod tests {
     use xai_x_thrift::action::InterstitialReason;
 
     #[test]
-    fn merge_verdict_prefers_the_more_severe_withholding_then_restricted_retweet() {
+    fn merge_source_prefers_the_more_severe_withholding_then_restricted_retweet() {
         let dropped = Verdict::Withheld(Decided {
             value: Withholding::Drop(DropReason::Legacy(FilteredReason::AuthorIsSuspended)),
+            id: RuleId::SuspendedAuthor,
             by: "suspended_author/drop",
         });
         let tombstoned = Verdict::Withheld(Decided {
             value: Withholding::Tombstone(TombstoneReason::LocalRegulations),
+            id: RuleId::NsfwHighPrecision,
             by: "nsfw_high_precision/tombstone/local_regulations",
         });
         let blurred = Verdict::Shown {
@@ -200,6 +330,7 @@ mod tests {
                     reason: InterstitialReason::Sensitive(true),
                     prompt: None,
                 }),
+                id: RuleId::NsfwUser,
                 by: "nsfw_user/blur/sensitive_user",
             }),
             engagement: None,
@@ -209,6 +340,7 @@ mod tests {
             media: None,
             engagement: Some(Decided {
                 value: LimitedEngagement::new(LimitedEngagementReason::ConversationControl),
+                id: RuleId::LimitRepliesByInvitation,
                 by: "limit_replies_by_invitation/limited_engagement/conversation_control",
             }),
         };
@@ -233,7 +365,16 @@ mod tests {
             (&unrestricted, &noticed, &noticed),
             (&limited, &noticed, &limited),
         ] {
-            assert_eq!(merge_verdict(retweet.clone(), source), *merged);
+            let retweet = PostEvaluation {
+                tweet_id: TweetId(1),
+                placement: Placement::Standalone,
+                source_tweet_id: Some(TweetId(5)),
+                evaluation: Evaluation::complete(retweet.clone()),
+                safety_labels: None,
+            };
+            let sources = HashMap::from([(TweetId(5), Evaluation::complete(source.clone()))]);
+            let (outcome, _) = merge_source(retweet, &sources);
+            assert_eq!(outcome.evaluation, Evaluation::complete(merged.clone()));
         }
     }
 
@@ -252,15 +393,10 @@ mod tests {
             has_uploaded_media,
             ..Default::default()
         };
-        let retweet = |author_id, source_tweet_id| PureCoreData {
-            author_id,
-            source_tweet_id: Some(source_tweet_id),
-            ..Default::default()
-        };
-        let sources = Arc::new(
+        let scenario = evaluate_tweets(
             InMemorySources::default()
-                .pure_core(4, retweet(40, 6))
-                .pure_core(5, retweet(50, 7))
+                .retweet(4, 40, 6, None)
+                .retweet(5, 50, 7, None)
                 .tweet(6, 60)
                 .tweet(7, 70)
                 .authors(&[40, 50, 60, 70])
@@ -269,63 +405,114 @@ mod tests {
                 .tweet_features(6, features(false, media(true, true)))
                 .tweet_features(7, features(false, media(true, false))),
         );
-        let filter_tweets = FilterTweets::new(sources, RuleEngine::for_tests());
-        let blurred = Evaluation::Complete {
-            verdict: legacy_interstitial("nsfw_account/legacy_interstitial"),
-        };
-        let allowed = Evaluation::Complete { verdict: allow() };
-        for tweet_ids in [vec![4, 5, 6, 7], vec![4, 5]] {
-            let outcomes = evaluate_merging_sources(
-                &filter_tweets,
-                FilterRequest {
-                    viewer_id: Some(1),
-                    country_code: None,
-                    client_capability: ClientCapability::default(),
-                    safety_level: SafetyLevel::TimelineHomeHydration,
-                    candidates: tweet_ids
-                        .iter()
-                        .map(|&tweet_id| RawCandidate {
-                            tweet_id: TweetId(tweet_id),
-                            request_author_id: None,
-                        })
-                        .collect(),
-                    rpc: Rpc::EvaluateTweets,
-                },
-            )
-            .await;
-            assert_eq!(outcomes[0].evaluation, blurred, "{tweet_ids:?}");
-            assert_eq!(outcomes[1].evaluation, allowed, "{tweet_ids:?}");
+        let blurred = Evaluation::complete(legacy_interstitial("nsfw_account/legacy_interstitial"));
+        let allowed = Evaluation::complete(allow());
+        for tweet_ids in [&[4, 5, 6, 7][..], &[4, 5]] {
+            let evaluations = scenario.evaluate(&requested(tweet_ids)).await.evaluations();
+            assert_eq!(evaluations[0], blurred, "{tweet_ids:?}");
+            assert_eq!(evaluations[1], allowed, "{tweet_ids:?}");
         }
     }
 
-    fn request(tweet_ids: &[u64]) -> FilterRequest {
-        FilterRequest {
-            viewer_id: Some(1),
-            country_code: None,
-            client_capability: ClientCapability::default(),
-            safety_level: SafetyLevel::TimelineHomeHydration,
-            candidates: tweet_ids
-                .iter()
-                .map(|&tweet_id| RawCandidate {
-                    tweet_id: TweetId(tweet_id),
-                    request_author_id: None,
-                })
-                .collect(),
-            rpc: Rpc::EvaluateTweets,
+    #[tokio::test]
+    async fn a_plain_article_retweet_merges_its_sources_age_drop_or_blur() {
+        use crate::hydration::sources::found_user;
+        use crate::models::{ArticleLifecycle, NsfwViewerDropReason};
+        use crate::rules::fixtures::{blurred, nsfw_viewer_dropped, CLIENT_CLASSES};
+        use std::num::NonZeroU64;
+        use xai_core_entities::entities::{ExtendedProfile, GizmoduckUser};
+        for (age, country, expected) in [
+            (
+                Some(17),
+                "us",
+                nsfw_viewer_dropped(
+                    NsfwViewerDropReason::IsUnderage,
+                    "sensitive_viewer_underage/drop",
+                ),
+            ),
+            (
+                None,
+                "de",
+                nsfw_viewer_dropped(
+                    NsfwViewerDropReason::HasNoStatedAge,
+                    "sensitive_viewer_no_stated_age/drop",
+                ),
+            ),
+            (
+                Some(18),
+                "us",
+                blurred(
+                    InterstitialReason::SensitiveUser(true),
+                    "nsfw_user/blur/sensitive_user",
+                ),
+            ),
+        ] {
+            for cover in [true, false] {
+                for tweet_ids in [&[4, 6][..], &[4]] {
+                    let mut author = found_user(60);
+                    author.user.as_mut().unwrap().safety.nsfw_user = true;
+                    let sources = InMemorySources::default()
+                        .retweet(4, 40, 6, Some(60))
+                        .tweet(6, 60)
+                        .authors(&[40])
+                        .user(60, author)
+                        .viewer(
+                            1,
+                            GizmoduckUser {
+                                user_id: 1,
+                                extended_profile: Some(ExtendedProfile { age_in_years: age }),
+                                ..Default::default()
+                            },
+                        )
+                        .tweet_features(
+                            6,
+                            TweetFeatures {
+                                article_id: NonZeroU64::new(70),
+                                nsfw: NsfwFeature {
+                                    user: true,
+                                    admin: false,
+                                },
+                                ..Default::default()
+                            },
+                        )
+                        .lifecycle(70, ArticleLifecycle::Published)
+                        .article_cover_media(70, cover)
+                        .article_media_entities(70, !cover);
+                    let scenario = evaluate_tweets(sources)
+                        .country(country)
+                        .client(CLIENT_CLASSES[0].capability);
+                    let evaluations = scenario.evaluate(&requested(tweet_ids)).await.evaluations();
+                    assert_eq!(
+                        evaluations[0],
+                        Evaluation::complete(expected.clone()),
+                        "{age:?} {cover} {tweet_ids:?}"
+                    );
+                }
+            }
         }
+    }
+
+    fn evaluate_tweets(sources: InMemorySources) -> Scenario<InMemorySources> {
+        Scenario::new(sources, SafetyLevel::TimelineHomeHydration)
+            .viewer(Some(1))
+            .rpc(Rpc::EvaluateTweets)
+    }
+
+    fn requested(tweet_ids: &[u64]) -> Vec<RawCandidate> {
+        tweet_ids
+            .iter()
+            .map(|&tweet_id| raw(tweet_id, None))
+            .collect()
     }
 
     fn retweet_world(share_names_author: bool) -> InMemorySources {
-        let shared = |author_id, source_tweet_id, source_user_id| PureCoreData {
-            source_user_id: Some(source_user_id).filter(|_| share_names_author),
-            ..retweet(author_id, source_tweet_id, source_user_id)
-        };
+        let share = |source_user_id| Some(source_user_id).filter(|_| share_names_author);
         let community = |root| control(ConversationControlArm::Community, root, &[]);
         InMemorySources::default()
-            .pure_core(1, shared(10, 5, 20))
+            .retweet(1, 10, 5, share(20))
             .tweet(2, 20)
-            .pure_core(3, shared(30, 5, 20))
-            .pure_core(4, shared(40, 6, 60))
+            .retweet(3, 30, 5, share(20))
+            .retweet(4, 40, 6, share(60))
             .tweet(5, 20)
             .pure_core(
                 6,
@@ -342,17 +529,8 @@ mod tests {
             .authors(&[10, 20, 30, 40, 60])
     }
 
-    fn retweet(author_id: u64, source_tweet_id: u64, source_user_id: u64) -> PureCoreData {
-        PureCoreData {
-            author_id,
-            source_tweet_id: Some(source_tweet_id),
-            source_user_id: Some(source_user_id),
-            ..Default::default()
-        }
-    }
-
     const TWEET_KEYED: [Source; 4] = [
-        Source::TesPureCore,
+        Source::TesPureCoreData,
         Source::TesTweet,
         Source::TesConversationControl,
         Source::SafetyLabels,
@@ -407,7 +585,7 @@ mod tests {
                 &[2][..],
                 format!(
                     "{}\nGizmoduckViewer [[1]]\nGizmoduckAuthor [[20]]
-Flock follows-rev[90] super_follows-fwd[]
+Flock follows-rev[90] super_follows-fwd[] blocks-rev[90]
 Flock follows-fwd[20] blocks-rev[20]",
                     tweet_keyed("[[2]]")
                 ),
@@ -418,7 +596,7 @@ Flock follows-fwd[20] blocks-rev[20]",
                 &[1, 2, 3, 5][..],
                 format!(
                     "{}\nGizmoduckViewer [[1]]\nGizmoduckAuthor [[10, 20, 30]]
-Flock follows-rev[80, 90] super_follows-fwd[]
+Flock follows-rev[80, 90] super_follows-fwd[] blocks-rev[80, 90]
 Flock follows-fwd[10, 20, 30] blocks-rev[10, 20, 30]",
                     tweet_keyed("[[1, 2, 3, 5]]")
                 ),
@@ -429,9 +607,9 @@ Flock follows-fwd[10, 20, 30] blocks-rev[10, 20, 30]",
                 &[1, 2, 3, 4][..],
                 format!(
                     "{}\nGizmoduckViewer [[1]]\nGizmoduckAuthor [[10, 20, 30, 40, 60]]
-Flock follows-rev[90] super_follows-fwd[]
+Flock follows-rev[90] super_follows-fwd[] blocks-rev[90]
 Flock follows-fwd[10, 20, 30, 40, 60] blocks-rev[10, 20, 30, 40, 60]
-Flock follows-rev[80] super_follows-fwd[]
+Flock follows-rev[80] super_follows-fwd[] blocks-rev[80]
 Flock follows-fwd[] blocks-rev[70]",
                     tweet_keyed("[[1, 2, 3, 4], [5, 6]]")
                 ),
@@ -442,9 +620,9 @@ Flock follows-fwd[] blocks-rev[70]",
                 &[1, 2, 3, 4][..],
                 format!(
                     "{}\nGizmoduckViewer [[1]]\nGizmoduckAuthor [[10, 20, 30, 40], [60]]
-Flock follows-rev[90] super_follows-fwd[]
+Flock follows-rev[90] super_follows-fwd[] blocks-rev[90]
 Flock follows-fwd[10, 20, 30, 40] blocks-rev[10, 20, 30, 40]
-Flock follows-rev[80] super_follows-fwd[]
+Flock follows-rev[80] super_follows-fwd[] blocks-rev[80]
 Flock follows-fwd[60] blocks-rev[60, 70]",
                     tweet_keyed("[[1, 2, 3, 4], [5, 6]]")
                 ),
@@ -455,45 +633,33 @@ Flock follows-fwd[60] blocks-rev[60, 70]",
                 &[1, 2, 3, 4][..],
                 format!(
                     "{}\nGizmoduckViewer [[1]]\nGizmoduckAuthor [[10, 20, 30, 40, 60]]
-Flock follows-rev[90] super_follows-fwd[]
+Flock follows-rev[90] super_follows-fwd[] blocks-rev[90]
 Flock follows-fwd[10, 20, 30, 40, 60] blocks-rev[10, 20, 30, 40, 60]
-Flock follows-rev[80] super_follows-fwd[]",
+Flock follows-rev[80] super_follows-fwd[] blocks-rev[80]",
                     tweet_keyed("[[1, 2, 3, 4], [5, 6]]")
                 ),
             ),
         ];
         for (name, world, tweet_ids, expected) in rows {
-            let sources = Arc::new(world);
-            let filter_tweets = FilterTweets::new(
-                Arc::<InMemorySources>::clone(&sources),
-                RuleEngine::for_tests(),
-            );
-            let outcomes = evaluate_merging_sources(&filter_tweets, request(tweet_ids)).await;
-            assert_eq!(batches(&sources), expected, "{name}");
-            assert_no_key_asked_twice(&sources, name);
+            let scenario = evaluate_tweets(world);
+            let evaluations = scenario.evaluate(&requested(tweet_ids)).await.evaluations();
+            assert_eq!(batches(scenario.sources()), expected, "{name}");
+            assert_no_key_asked_twice(scenario.sources(), name);
             assert!(
-                outcomes
+                evaluations
                     .iter()
-                    .all(|outcome| matches!(outcome.evaluation, Evaluation::Complete { .. })),
+                    .all(|evaluation| matches!(evaluation, Evaluation::Complete { .. })),
                 "{name}"
             );
         }
         for tweet_ids in [&[2][..], &[1, 2, 3, 5]] {
-            let plain = Arc::new(retweet_world(true));
-            FilterTweets::new(
-                Arc::<InMemorySources>::clone(&plain),
-                RuleEngine::for_tests(),
-            )
-            .hydrate(request(tweet_ids))
-            .await;
-            let merged = Arc::new(retweet_world(true));
-            let filter_tweets = FilterTweets::new(
-                Arc::<InMemorySources>::clone(&merged),
-                RuleEngine::for_tests(),
-            );
-            evaluate_merging_sources(&filter_tweets, request(tweet_ids)).await;
+            let plain = evaluate_tweets(retweet_world(true)).rpc(Rpc::FilterTweets);
+            plain.hydrate(&requested(tweet_ids)).await;
+            let merged = evaluate_tweets(retweet_world(true));
+            merged.evaluate(&requested(tweet_ids)).await;
+            let (merged, plain) = (merged.sources(), plain.sources());
             assert_eq!(merged.calls(), plain.calls(), "{tweet_ids:?}");
-            assert_eq!(batches(&merged), batches(&plain), "{tweet_ids:?}");
+            assert_eq!(batches(merged), batches(plain), "{tweet_ids:?}");
         }
     }
 
@@ -526,7 +692,7 @@ Flock follows-rev[80] super_follows-fwd[]",
         Failed(Lookup),
     }
 
-    fn arms(outcomes: &[FilterOutcome]) -> Vec<Arm> {
+    fn arms(outcomes: &[PostEvaluation]) -> Vec<Arm> {
         outcomes
             .iter()
             .map(|outcome| match outcome.evaluation {
@@ -559,7 +725,7 @@ Flock follows-rev[80] super_follows-fwd[]",
     fn slow_world(share_names_author: bool) -> InMemorySources {
         let ms = Duration::from_millis;
         retweet_world(share_names_author)
-            .latency(Source::TesPureCore, ms(10))
+            .latency(Source::TesPureCoreData, ms(10))
             .latency(Source::TesTweet, ms(30))
             .latency(Source::TesConversationControl, ms(20))
             .latency(Source::SafetyLabels, ms(15))
@@ -572,25 +738,17 @@ Flock follows-rev[80] super_follows-fwd[]",
     async fn requested_calls_start_as_they_do_without_sources() {
         let ms = Duration::from_millis;
         for share_names_author in [true, false] {
-            let alone = Arc::new(slow_world(share_names_author));
+            let raw = requested(&[1, 2, 3, 4]);
+            let alone = evaluate_tweets(slow_world(share_names_author)).rpc(Rpc::FilterTweets);
             let t0 = tokio::time::Instant::now();
-            FilterTweets::new(
-                Arc::<InMemorySources>::clone(&alone),
-                RuleEngine::for_tests(),
-            )
-            .hydrate(request(&[1, 2, 3, 4]))
-            .await;
-            let alone = starts(&alone, t0);
+            alone.hydrate(&raw).await;
+            let alone = starts(alone.sources(), t0);
 
-            let expanded = Arc::new(slow_world(share_names_author));
+            let expanded = evaluate_tweets(slow_world(share_names_author));
             let t0 = tokio::time::Instant::now();
-            let filter_tweets = FilterTweets::new(
-                Arc::<InMemorySources>::clone(&expanded),
-                RuleEngine::for_tests(),
-            );
-            evaluate_merging_sources(&filter_tweets, request(&[1, 2, 3, 4])).await;
+            expanded.evaluate(&raw).await;
             let elapsed = t0.elapsed();
-            let expanded = starts(&expanded, t0);
+            let expanded = starts(expanded.sources(), t0);
 
             for (alone, expanded) in alone.iter().zip(&expanded) {
                 assert_eq!(alone[..], expanded[..alone.len()], "{share_names_author}");
@@ -615,7 +773,7 @@ Flock follows-rev[80] super_follows-fwd[]",
 
     #[tokio::test(start_paused = true)]
     async fn a_source_failure_fails_only_its_retweets() {
-        use crate::hydration::HYDRATION_TIMEOUT;
+        use crate::hydration::{BEST_EFFORT_HYDRATION_TIMEOUT, HYDRATION_TIMEOUT};
         use Arm::{Complete, Partial};
         let rows = [
             (
@@ -631,7 +789,7 @@ Flock follows-rev[80] super_follows-fwd[]",
             ),
             (
                 "source pure core",
-                retweet_world(true).fail_key(Source::TesPureCore, 6),
+                retweet_world(true).fail_key(Source::TesPureCoreData, 6),
                 [
                     Complete,
                     Complete,
@@ -653,7 +811,7 @@ Flock follows-rev[80] super_follows-fwd[]",
             ),
             (
                 "deleted source",
-                retweet_world(true).pure_core(4, retweet(40, 7, 70)),
+                retweet_world(true).retweet(4, 40, 7, Some(70)),
                 [
                     Complete,
                     Complete,
@@ -665,7 +823,7 @@ Flock follows-rev[80] super_follows-fwd[]",
             (
                 "source reply-root select",
                 retweet_world(true).fail_edge(Graph::Blocks, 70),
-                [Complete, Complete, Complete, Partial],
+                [Complete; 4],
                 Duration::ZERO,
             ),
             (
@@ -673,14 +831,14 @@ Flock follows-rev[80] super_follows-fwd[]",
                 retweet_world(true)
                     .control(2, control(ConversationControlArm::Subscribers, 80, &[]))
                     .fail_edge(Graph::Follows, 80),
-                [Partial, Complete, Partial, Complete],
+                [Complete; 4],
                 Duration::ZERO,
             ),
             (
                 "timed-out source root select",
                 retweet_world(true).key_latency(Source::Flock, 80, HYDRATION_TIMEOUT * 2),
-                [Partial, Complete, Partial, Complete],
-                HYDRATION_TIMEOUT,
+                [Complete; 4],
+                BEST_EFFORT_HYDRATION_TIMEOUT,
             ),
             (
                 "timed-out source controls",
@@ -689,21 +847,44 @@ Flock follows-rev[80] super_follows-fwd[]",
                     5,
                     HYDRATION_TIMEOUT * 2,
                 ),
-                [Partial, Complete, Partial, Partial],
-                HYDRATION_TIMEOUT,
+                [Complete; 4],
+                BEST_EFFORT_HYDRATION_TIMEOUT,
+            ),
+            (
+                "source safety labels",
+                retweet_world(true).fail_key(Source::SafetyLabels, 6),
+                [Complete, Complete, Complete, Partial],
+                Duration::ZERO,
             ),
         ];
         for (name, world, expected, elapsed) in rows {
-            let sources = Arc::new(world);
-            let filter_tweets = FilterTweets::new(
-                Arc::<InMemorySources>::clone(&sources),
-                RuleEngine::for_tests(),
-            );
             let t0 = tokio::time::Instant::now();
-            let outcomes = evaluate_merging_sources(&filter_tweets, request(&[1, 2, 3, 4])).await;
+            let evaluated = evaluate_tweets(world)
+                .evaluate(&requested(&[1, 2, 3, 4]))
+                .await;
             assert_eq!(t0.elapsed(), elapsed, "{name}");
-            assert_eq!(arms(&outcomes), expected, "{name}");
+            assert_eq!(arms(&evaluated.outcomes), expected, "{name}");
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_retweet_whose_only_failure_is_best_effort_still_takes_its_sources_drop() {
+        use crate::rules::fixtures::dropped;
+        let world = || {
+            retweet_world(true)
+                .user(60, suspended())
+                .fail_edge(Graph::Follows, 40)
+        };
+        assert_eq!(
+            evaluate_tweets(world())
+                .evaluate(&requested(&[4]))
+                .await
+                .evaluations(),
+            [Evaluation::Complete {
+                verdict: dropped(FilteredReason::AuthorIsSuspended, "suspended_author/drop"),
+                fail_open_defaults: Hydrators::of(Hydrator::BlockedByAuthor),
+            }]
+        );
     }
 
     #[derive(Clone, Copy, Debug)]
@@ -719,15 +900,12 @@ Flock follows-rev[80] super_follows-fwd[]",
         shared_author: Answer,
         share_names_author: bool,
     ) -> InMemorySources {
-        let share = PureCoreData {
-            source_user_id: Some(20).filter(|_| share_names_author),
-            ..retweet(10, 5, 20)
-        };
-        let sources = InMemorySources::default().pure_core(1, share);
+        let source_user_id = Some(20).filter(|_| share_names_author);
+        let sources = InMemorySources::default().retweet(1, 10, 5, source_user_id);
         let sources = match shared_tweet {
             Answer::Found => sources.tweet(5, 20),
             Answer::NotFound => sources,
-            Answer::Failed => sources.tweet(5, 20).fail_key(Source::TesPureCore, 5),
+            Answer::Failed => sources.tweet(5, 20).fail_key(Source::TesPureCoreData, 5),
         };
         [(10, author), (20, shared_author)].into_iter().fold(
             sources,
@@ -740,17 +918,16 @@ Flock follows-rev[80] super_follows-fwd[]",
     }
 
     async fn retweet_status(sources: InMemorySources, tweet_ids: &[u64]) -> Evaluation {
-        let filter_tweets = FilterTweets::new(Arc::new(sources), RuleEngine::for_tests());
-        evaluate_merging_sources(&filter_tweets, request(tweet_ids))
-            .await
-            .remove(0)
-            .evaluation
+        let evaluated = evaluate_tweets(sources)
+            .evaluate(&requested(tweet_ids))
+            .await;
+        evaluated.evaluations().remove(0)
     }
 
     #[tokio::test]
     async fn a_retweet_resolves_only_when_its_shared_tweet_and_shared_author_answer() {
         use Answer::{Failed, Found, NotFound};
-        let judged = Evaluation::Complete { verdict: allow() };
+        let judged = Evaluation::complete(allow());
         let both = |expected: Evaluation| [expected.clone(), expected];
         let rows = [
             (Found, Found, Found, both(judged.clone())),
@@ -861,45 +1038,39 @@ Flock follows-rev[80] super_follows-fwd[]",
             );
         }
 
-        let filter_tweets = FilterTweets::new(
-            Arc::new(shared_lookups(Found, NotFound, NotFound, true)),
-            RuleEngine::for_tests(),
-        );
-        let outcome = filter_tweets
-            .run(FilterRequest {
-                rpc: Rpc::FilterTweets,
-                ..request(&[1])
-            })
-            .await
-            .outcomes
-            .remove(0);
-        assert_eq!(outcome.evaluation, judged);
+        let evaluated = evaluate_tweets(shared_lookups(Found, NotFound, NotFound, true))
+            .rpc(Rpc::FilterTweets)
+            .evaluate(&requested(&[1]))
+            .await;
+        assert_eq!(evaluated.evaluations(), [judged]);
     }
 
     #[tokio::test(start_paused = true)]
     async fn a_requested_key_asked_by_a_source_batch_shares_its_fate() {
-        use Arm::{Complete, Partial};
         let ms = Duration::from_millis;
-        let world = || {
-            retweet_world(true)
+        let world = |root_fails: bool| {
+            let world = retweet_world(true)
                 .control(5, control(ConversationControlArm::Community, 90, &[]))
-                .key_latency(Source::TesConversationControl, 2, ms(30))
+                .key_latency(Source::TesConversationControl, 2, ms(30));
+            if root_fails {
+                world.fail_edge(Graph::Follows, 90)
+            } else {
+                world
+            }
         };
-        for (world, expected) in [
-            (world(), [Complete; 4]),
-            (
-                world().fail_edge(Graph::Follows, 90),
-                [Partial, Partial, Partial, Complete],
-            ),
-        ] {
-            let sources = Arc::new(world);
-            let filter_tweets = FilterTweets::new(
-                Arc::<InMemorySources>::clone(&sources),
-                RuleEngine::for_tests(),
+        for (root_fails, failed_ids) in [(false, &[][..]), (true, &[2])] {
+            let hydrated = evaluate_tweets(world(root_fails))
+                .hydrate(&requested(&[1, 2, 3, 4]))
+                .await;
+            assert_eq!(
+                hydrated.failed_ids,
+                failed_ids.iter().map(|&id| TweetId(id)).collect()
             );
+            let scenario = evaluate_tweets(world(root_fails));
             let t0 = tokio::time::Instant::now();
-            let outcomes = evaluate_merging_sources(&filter_tweets, request(&[1, 2, 3, 4])).await;
-            assert_eq!(arms(&outcomes), expected);
+            let evaluated = scenario.evaluate(&requested(&[1, 2, 3, 4])).await;
+            assert_eq!(arms(&evaluated.outcomes), [Arm::Complete; 4]);
+            let sources = scenario.sources();
             let root_selects: Vec<(Duration, Vec<u64>)> = sources
                 .selects()
                 .into_iter()
@@ -922,26 +1093,19 @@ Flock follows-rev[80] super_follows-fwd[]",
     async fn the_source_of_a_failed_retweet_changes_no_verdict() {
         let world = || retweet_world(true).fail_key(Source::TesTweet, 4);
         let judged = |world: InMemorySources| async move {
-            let sources = Arc::new(world);
-            let filter_tweets = FilterTweets::new(
-                Arc::<InMemorySources>::clone(&sources),
-                RuleEngine::for_tests(),
-            );
-            let outcomes = evaluate_merging_sources(&filter_tweets, request(&[1, 2, 3, 4])).await;
+            let scenario = evaluate_tweets(world);
+            let evaluated = scenario.evaluate(&requested(&[1, 2, 3, 4])).await;
             assert_eq!(
-                sources.keys(Source::TesPureCore),
+                scenario.sources().keys(Source::TesPureCoreData),
                 [vec![1, 2, 3, 4], vec![5, 6]]
             );
-            outcomes
-                .into_iter()
-                .map(|outcome| outcome.evaluation)
-                .collect::<Vec<_>>()
+            evaluated.evaluations()
         };
         let healthy = judged(world()).await;
         assert_eq!(healthy[3], Evaluation::Failed(Lookup::Tweet));
         for source_side in [
             world().user(60, suspended()),
-            world().fail_key(Source::TesPureCore, 6),
+            world().fail_key(Source::TesPureCoreData, 6),
             world().fail_key(Source::GizmoduckAuthor, 60),
             world().fail_edge(Graph::Blocks, 70),
         ] {
@@ -958,79 +1122,99 @@ Flock follows-rev[80] super_follows-fwd[]",
             )]),
         };
         let sources = InMemorySources::default()
-            .pure_core(1, retweet(10, 5, 20))
+            .retweet(1, 10, 5, Some(20))
             .tweet(5, 20)
             .labels(5, fosnr)
             .authors(&[10, 20])
             .edge(Graph::Follows, 1, 20);
-        let filter_tweets = FilterTweets::new(Arc::new(sources), RuleEngine::for_tests());
-        let outcomes = evaluate_merging_sources(&filter_tweets, request(&[1])).await;
+        let evaluated = evaluate_tweets(sources).evaluate(&requested(&[1])).await;
         assert_eq!(
-            outcomes[0].evaluation,
-            Evaluation::Complete {
-                verdict: noticed(
-                    true,
-                    false,
-                    "fosnr_abuse_insults_follower/soft_intervention/abuse"
-                ),
-            }
+            evaluated.evaluations(),
+            [Evaluation::complete(noticed(
+                true,
+                false,
+                "fosnr_abuse_insults_follower/soft_intervention/abuse"
+            ))]
         );
     }
 
     #[tokio::test]
+    async fn a_retweet_of_a_reaction_post_carries_the_reactions_blur() {
+        use crate::rules::fixtures::blurred;
+        use crate::scenario::{label_map, reaction_to};
+        let adult = Evaluation::complete(blurred(
+            InterstitialReason::Sensitive(true),
+            "original_tweet_adult_media_propagation/blur/sensitive",
+        ));
+        for tweet_ids in [&[1, 5][..], &[1]] {
+            let sources = InMemorySources::default()
+                .retweet(1, 10, 5, Some(20))
+                .tweet(5, 20)
+                .tweet_features(5, reaction_to(7, 70))
+                .labels(7, label_map(SafetyLabelType::NSFW_HIGH_PRECISION))
+                .authors(&[10, 20, 70]);
+            let evaluations = evaluate_tweets(sources)
+                .evaluate(&requested(tweet_ids))
+                .await
+                .evaluations();
+            assert_eq!(evaluations[0], adult, "{tweet_ids:?}");
+        }
+    }
+
+    #[tokio::test]
     async fn a_viewer_removed_from_the_community_is_limited_on_any_retweet_of_its_post() {
-        let sources = InMemorySources::default()
-            .pure_core(1, retweet(10, 5, 20))
-            .tweet(5, 20)
-            .tweet_features(
-                5,
-                TweetFeatures {
-                    community_id: NonZeroU64::new(500),
-                    ..TweetFeatures::default()
-                },
-            )
-            .authors(&[10, 20])
-            .removed_from(500);
-        let filter_tweets = FilterTweets::new(Arc::new(sources), RuleEngine::for_tests());
-        let request = FilterRequest {
-            client_capability: ClientCapability {
-                community_viewer_removed_limits: true,
-                ..ClientCapability::default()
-            },
-            ..request(&[1, 5])
+        let limits = ClientCapability {
+            community_viewer_removed_limits: true,
+            ..ClientCapability::default()
         };
-        let outcomes = evaluate_merging_sources(&filter_tweets, request).await;
-        let removed_limit = Evaluation::Complete {
-            verdict: limited(
-                LimitedEngagementReason::CommunityTweetViewerRemoved,
-                "community_tweet_viewer_removed/limited_engagement",
-            ),
+        let world = || {
+            InMemorySources::default()
+                .retweet(1, 10, 5, Some(20))
+                .tweet(5, 20)
+                .community_post(5, 500)
+                .authors(&[10, 20])
+                .removed_from(500)
         };
-        assert_eq!(outcomes[0].evaluation, removed_limit);
-        assert_eq!(outcomes[1].evaluation, removed_limit);
+        let evaluated = evaluate_tweets(world())
+            .client(limits)
+            .evaluate(&requested(&[1, 5]))
+            .await;
+        let removed_limit = Evaluation::complete(limited(
+            LimitedEngagementReason::CommunityTweetViewerRemoved,
+            "community_tweet_viewer_removed/limited_engagement",
+        ));
+        assert_eq!(
+            evaluated.evaluations(),
+            [removed_limit.clone(), removed_limit]
+        );
+
+        let unrequested_source = evaluate_tweets(world()).client(limits);
+        unrequested_source.evaluate(&requested(&[1])).await;
+        assert_eq!(
+            unrequested_source
+                .sources()
+                .keys(Source::CommunityViewerRemoved),
+            [vec![500]]
+        );
     }
 
     #[tokio::test(start_paused = true)]
     async fn a_root_follows_the_viewer_by_the_select_that_asked_it() {
         use ConversationControlArm::{MyNetwork, Subscribers};
-        let sources = Arc::new(
+        let scenario = evaluate_tweets(
             retweet_world(true)
                 .control(2, control(MyNetwork, 90, &[]))
                 .control(5, control(Subscribers, 90, &[]))
                 .edge(Graph::Follows, 90, 1)
                 .key_latency(Source::TesConversationControl, 2, Duration::from_millis(30)),
         );
-        let filter_tweets = FilterTweets::new(
-            Arc::<InMemorySources>::clone(&sources),
-            RuleEngine::for_tests(),
-        );
-        let outcomes = evaluate_merging_sources(&filter_tweets, request(&[1, 2, 3, 4])).await;
-        assert!(
-            outcomes
-                .iter()
-                .all(|outcome| matches!(outcome.evaluation, Evaluation::Complete { .. }))
-        );
-        let root_selects: Vec<String> = batches(&sources)
+        let evaluated = scenario.evaluate(&requested(&[1, 2, 3, 4])).await;
+        assert!(evaluated
+            .evaluations()
+            .iter()
+            .all(|evaluation| matches!(evaluation, Evaluation::Complete { .. })));
+        let sources = scenario.sources();
+        let root_selects: Vec<String> = batches(sources)
             .lines()
             .filter(|line| line.contains("super_follows-fwd"))
             .map(str::to_owned)
@@ -1038,30 +1222,140 @@ Flock follows-rev[80] super_follows-fwd[]",
         assert_eq!(
             root_selects,
             [
-                "Flock follows-rev[] super_follows-fwd[90]",
-                "Flock follows-rev[90] super_follows-fwd[]",
+                "Flock follows-rev[] super_follows-fwd[90] blocks-rev[90]",
+                "Flock follows-rev[90] super_follows-fwd[] blocks-rev[]",
             ]
         );
         assert!(sources.keys(Source::Wingman).is_empty());
     }
 
     #[tokio::test]
+    async fn a_fetched_source_whose_conversation_root_blocks_the_viewer_limits_its_retweet() {
+        let scenario = evaluate_tweets(
+            InMemorySources::default()
+                .retweet(5, 40, 2, Some(20))
+                .pure_core(
+                    2,
+                    PureCoreData {
+                        author_id: 20,
+                        conversation_id: Some(100),
+                        in_reply_to_tweet_id: Some(101),
+                        in_reply_to_user_id: Some(99),
+                        ..Default::default()
+                    },
+                )
+                .tweet(100, 30)
+                .authors(&[20, 40])
+                .edge(Graph::Blocks, 30, 1),
+        );
+        let evaluated = scenario.evaluate(&requested(&[5])).await;
+        assert_eq!(
+            evaluated.evaluations(),
+            [Evaluation::complete(limited(
+                LimitedEngagementReason::RootAuthorBlockedViewer,
+                "blocked_viewer/limited_engagement/root_author_blocked_viewer",
+            ))]
+        );
+        let sources = scenario.sources();
+        assert_eq!(
+            batches(sources),
+            "\
+TesPureCoreData [[5], [2], [100]]
+TesTweet [[5], [2]]
+TesConversationControl [[5], [2]]
+SafetyLabels [[5], [2]]
+GizmoduckViewer [[1]]
+GizmoduckAuthor [[20, 40]]
+Flock follows-fwd[20, 40] blocks-rev[20, 40]
+Flock blocks-rev[30]"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_fetched_source_that_names_a_source_joins_it_and_its_miss_makes_the_retweet_partial()
+    {
+        let world = || {
+            InMemorySources::default()
+                .retweet(1, 10, 5, Some(20))
+                .retweet(5, 20, 7, Some(70))
+                .authors(&[10, 20, 70])
+        };
+        let source_incomplete = Evaluation::Partial {
+            verdict: allow(),
+            fail_open_defaults: Hydrators::empty(),
+        };
+        let rows = [
+            ("found", world().tweet(7, 70), Evaluation::complete(allow())),
+            ("not found", world(), source_incomplete.clone()),
+            (
+                "fails",
+                world().tweet(7, 70).fail_key(Source::TesPureCoreData, 7),
+                source_incomplete,
+            ),
+        ];
+        for (name, sources, expected) in rows {
+            let scenario = evaluate_tweets(sources);
+            let evaluated = scenario.evaluate(&requested(&[1])).await;
+            assert_eq!(evaluated.evaluations(), [expected], "{name}");
+            assert_eq!(
+                scenario.sources().keys(Source::TesPureCoreData),
+                [vec![1], vec![5], vec![7]],
+                "{name}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_requested_stale_source_is_dropped_standalone_and_kept_as_its_retweets_source() {
+        use crate::rules::fixtures::dropped;
+        use xai_core_entities::entities::{EditControl, EditControlInitial};
+        let superseded = TweetFeatures {
+            edit_control: Some(EditControl::Initial(EditControlInitial {
+                edit_tweet_ids: vec![5, 6],
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+        let scenario = Scenario::new(
+            InMemorySources::default()
+                .retweet(1, 10, 5, Some(50))
+                .tweet(5, 50)
+                .tweet_features(5, superseded)
+                .authors(&[10, 50]),
+            SafetyLevel::TimelineHome,
+        )
+        .viewer(Some(1))
+        .rpc(Rpc::EvaluateTweets);
+        let stale = Evaluation::complete(dropped(
+            FilteredReason::UnspecifiedReason,
+            "stale_tweet/drop/unspecified",
+        ));
+        let allowed = Evaluation::complete(allow());
+        assert_eq!(
+            scenario.evaluate(&requested(&[1, 5])).await.evaluations(),
+            [allowed.clone(), stale]
+        );
+        assert_eq!(
+            scenario.evaluate(&requested(&[1])).await.evaluations(),
+            [allowed]
+        );
+    }
+
+    #[tokio::test]
     async fn each_request_kind_labels_its_phase_samples() {
-        use crate::rules::metrics::RetweetSources::{Fetched, InBatch, NoSource};
-        let filter_tweets =
-            FilterTweets::new(Arc::new(retweet_world(true)), RuleEngine::for_tests());
+        use crate::metrics::RetweetSources::{Fetched, InBatch, NoSource};
+        let scenario = evaluate_tweets(retweet_world(true));
         for (tweet_ids, expected) in [
             (&[2][..], NoSource),
             (&[1, 2, 3, 5], InBatch),
             (&[1, 2, 3, 4], Fetched),
         ] {
-            let hydrated = filter_tweets
-                .hydrate_with_retweet_sources(request(tweet_ids))
-                .await;
-            assert_eq!(hydrated.retweet_sources(), expected, "{tweet_ids:?}");
+            let evaluated = scenario.evaluate(&requested(tweet_ids)).await;
+            assert_eq!(evaluated.retweet_sources, expected, "{tweet_ids:?}");
         }
-        let plain = filter_tweets.hydrate(request(&[1, 2, 3, 4])).await;
-        assert_eq!(plain.retweet_sources(), NoSource);
+        let plain = scenario.rpc(Rpc::FilterTweets);
+        let evaluated = plain.evaluate(&requested(&[1, 2, 3, 4])).await;
+        assert_eq!(evaluated.retweet_sources, NoSource);
         assert_eq!(<&str>::from(NoSource), "none");
     }
 }

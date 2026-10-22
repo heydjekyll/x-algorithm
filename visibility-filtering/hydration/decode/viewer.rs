@@ -1,6 +1,6 @@
 use crate::models::{ViewerAge, ViewerProfile};
 use xai_core_entities::entities::{
-    AccessPolicy, GizmoduckUser, Labels, SubscriptionLevel, VerifiedType,
+    AccessPolicy, GizmoduckUser, Labels, Safety, SubscriptionLevel, VerifiedType,
 };
 use xai_core_entities::gizmoduck_client::{QueryFields, ViewerData};
 use xai_x_thrift::user_labels::LabelValue;
@@ -29,28 +29,70 @@ fn has_age_verified_18_label(labels: &Labels) -> bool {
         .any(|label| LabelValue(label.label_value) == LabelValue::AGE_VERIFIED_18)
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, strum::IntoStaticStr)]
+#[strum(serialize_all = "snake_case")]
+pub(crate) enum ViewerState {
+    Offboarded,
+    Erased,
+    Deactivated,
+    Suspended,
+    Active,
+}
+
+impl ViewerState {
+    fn of(safety: &Safety) -> Self {
+        if safety.offboarded {
+            Self::Offboarded
+        } else if safety.erased {
+            Self::Erased
+        } else if safety.deactivated {
+            Self::Deactivated
+        } else if safety.suspended {
+            Self::Suspended
+        } else {
+            Self::Active
+        }
+    }
+}
+
 #[derive(Default)]
 pub(crate) struct DecodedViewer {
     pub(crate) profile: ViewerProfile,
     pub(crate) has_age_verified_18_label: bool,
+    pub(crate) state: Option<ViewerState>,
 }
 
 pub(crate) fn decode_viewer(user: Option<&GizmoduckUser>, fields: &[QueryFields]) -> DecodedViewer {
     match user {
         Some(user) => DecodedViewer {
-            profile: profile(ViewerData::from_user(user, fields)),
+            profile: ViewerProfile {
+                is_new_account: is_new_account(user.created_at_msec),
+                ..profile(ViewerData::from_user(user, fields))
+            },
             has_age_verified_18_label: has_age_verified_18_label(&user.labels),
+            state: Some(ViewerState::of(&user.safety)),
         },
         None => DecodedViewer::default(),
     }
 }
 
-fn profile(data: ViewerData) -> ViewerProfile {
-    let viewer_age = match data.age_in_years {
-        Some(age) => ViewerAge::Known(age),
-        None if data.user_exists => ViewerAge::NotStated,
-        None => ViewerAge::Unknown,
+fn is_new_account(created_at_msec: Option<i64>) -> bool {
+    const NEW_ACCOUNT_AGE: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
+    let Some(created_at) = created_at_msec
+        .and_then(|ms| u64::try_from(ms).ok())
+        .map(|ms| std::time::UNIX_EPOCH + std::time::Duration::from_millis(ms))
+    else {
+        return false;
     };
+    std::time::SystemTime::now()
+        .duration_since(created_at)
+        .is_ok_and(|age| age < NEW_ACCOUNT_AGE)
+}
+
+fn profile(data: ViewerData) -> ViewerProfile {
+    let viewer_age = data
+        .age_in_years
+        .map_or(ViewerAge::NotStated, ViewerAge::Known);
     ViewerProfile {
         allows_sensitive_media: data.nsfw_view.unwrap_or(false),
         viewer_age,
@@ -58,6 +100,7 @@ fn profile(data: ViewerData) -> ViewerProfile {
         has_idv_premium: has_idv_premium(&data),
         is_read_only: data.access_policy == AccessPolicy::BounceAllPublicWrites,
         account_country_code: data.account_country_code.map(|c| c.to_ascii_lowercase()),
+        is_new_account: false,
     }
 }
 
@@ -67,7 +110,7 @@ mod tests {
     use xai_core_entities::entities::Label;
 
     #[test]
-    fn viewer_existence_and_preference_determine_age_and_sensitive_media() {
+    fn a_found_viewer_without_an_age_has_none_stated_whatever_its_state() {
         for (data, expected_age, expected_sensitive_media) in [
             (
                 ViewerData {
@@ -83,13 +126,21 @@ mod tests {
                 ViewerData {
                     user_exists: true,
                     nsfw_view: Some(true),
+                    age_in_years: Some(30),
+                    ..Default::default()
+                },
+                ViewerAge::Known(30),
+                true,
+            ),
+            (
+                ViewerData {
+                    user_exists: false,
                     age_in_years: None,
                     ..Default::default()
                 },
                 ViewerAge::NotStated,
-                true,
+                false,
             ),
-            (ViewerData::default(), ViewerAge::Unknown, false),
         ] {
             let viewer = profile(data);
             assert_eq!(viewer.viewer_age, expected_age);
@@ -195,5 +246,52 @@ mod tests {
                 "{values:?}"
             );
         }
+    }
+
+    #[test]
+    fn viewer_state_takes_the_first_set_flag_and_a_missing_viewer_has_none() {
+        let all = Safety {
+            offboarded: true,
+            erased: true,
+            deactivated: true,
+            suspended: true,
+            ..Default::default()
+        };
+        for (safety, expected) in [
+            (all.clone(), ViewerState::Offboarded),
+            (
+                Safety {
+                    offboarded: false,
+                    ..all.clone()
+                },
+                ViewerState::Erased,
+            ),
+            (
+                Safety {
+                    suspended: true,
+                    deactivated: true,
+                    ..Default::default()
+                },
+                ViewerState::Deactivated,
+            ),
+            (
+                Safety {
+                    suspended: true,
+                    ..Default::default()
+                },
+                ViewerState::Suspended,
+            ),
+            (Safety::default(), ViewerState::Active),
+        ] {
+            let user = GizmoduckUser {
+                safety,
+                ..Default::default()
+            };
+            assert_eq!(
+                decode_viewer(Some(&user), &[QueryFields::SAFETY]).state,
+                Some(expected)
+            );
+        }
+        assert_eq!(decode_viewer(None, &[QueryFields::SAFETY]).state, None);
     }
 }

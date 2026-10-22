@@ -111,6 +111,9 @@ pub struct AppState {
         pub kafka_ready: std::sync::Arc<std::sync::atomic::AtomicBool>,
                 pub kafka_producers: crate::KafkaProducers,
                 pub hold_gate: std::sync::Arc<crate::overturn_hold::HoldGate>,
+                pub off_switch: std::sync::Arc<crate::off_switch::OffSwitch>,
+            pub action_control: std::sync::Arc<crate::action_control::ActionControl>,
+                pub backfill: std::sync::Arc<crate::backfill::Backfill>,
                 pub boot_config: serde_json::Value,
 }
 
@@ -2070,9 +2073,909 @@ pub async fn handle_allowlist_delete_entity(
     }
 }
 
+
+use crate::off_switch::{
+    OffSwitchListResponse, OffSwitchPutRequest, OffSwitchView, SetError, SetOutcome,
+};
+
+#[utoipa::path(
+    get,
+    path = "/off_switches",
+    tag = "off_switch",
+    security(("BearerAuth" = [])),
+    responses(
+        (status = 200, description = "Stored switches and this pod's list state", body = OffSwitchListResponse),
+    ),
+)]
+#[tracing::instrument(skip_all)]
+pub async fn handle_off_switches_get(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let resp = state
+        .off_switch
+        .list(
+            state.dynamic_config.off_switch_enabled(),
+            crate::now_millis(),
+        )
+        .await;
+    (StatusCode::OK, Json(resp))
+}
+
+#[utoipa::path(
+    put,
+    path = "/off_switches",
+    tag = "off_switch",
+    security(("BearerAuth" = [])),
+    request_body = OffSwitchPutRequest,
+    responses(
+        (status = 200, description = "Stored switch", body = OffSwitchView),
+        (status = 400, description = "Invalid head / classifier / reason / auto_on_at_ms"),
+        (status = 500, description = "Manhattan write failed"),
+    ),
+)]
+#[tracing::instrument(skip_all)]
+pub async fn handle_off_switches_put(
+    State(state): State<Arc<AppState>>,
+    Extension(actor): Extension<KeyId>,
+    method: Method,
+    uri: Uri,
+    Json(req): Json<OffSwitchPutRequest>,
+) -> impl IntoResponse {
+    info!(
+        head = %req.head,
+        classifier = req.classifier.as_deref().unwrap_or(""),
+        off = req.off,
+        "PUT /api/off_switches"
+    );
+    let request_json = serde_json::to_string(&req).unwrap_or_default();
+    let result = state
+        .off_switch
+        .set(req, &actor.0, crate::now_millis())
+        .await;
+    if let Err(SetError::Invalid(msg)) = &result {
+        return (StatusCode::BAD_REQUEST, Json(json!({ "error": msg })));
+    }
+    publish_admin_action_event(
+        state.kafka_producers.admin_actions(),
+        &off_switch_admin_event(actor.0, &method, uri.path(), request_json, &result),
+    );
+    match result {
+        Ok(out) => (
+            StatusCode::OK,
+            Json(serde_json::to_value(out.view).unwrap_or_default()),
+        ),
+        Err(e) => {
+            error!("PUT /api/off_switches failed: {e:?}");
+            let msg = match e {
+                SetError::Invalid(m) | SetError::Store(m) => m,
+            };
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": msg })),
+            )
+        }
+    }
+}
+
+pub(crate) fn off_switch_admin_event(
+    actor_key_id: String,
+    method: &Method,
+    path: &str,
+    request_json: String,
+    result: &Result<SetOutcome, SetError>,
+) -> AdminActionEvent {
+    let (success, error, before_json) = match result {
+        Ok(out) => (
+            true,
+            String::new(),
+            out.before
+                .as_ref()
+                .and_then(|b| serde_json::to_string(b).ok())
+                .unwrap_or_default(),
+        ),
+        Err(SetError::Invalid(e) | SetError::Store(e)) => (false, e.clone(), String::new()),
+    };
+    AdminActionEvent {
+        occurred_at_ms: crate::now_millis(),
+        action: AdminAction::Unspecified as i32,
+        actor_key_id,
+        environment: AUDIT_ENVIRONMENT.clone(),
+        http_method: method.to_string(),
+        http_path: path.to_string(),
+        success,
+        error,
+        request_json,
+        before_json,
+        ..Default::default()
+    }
+}
+
+
+use crate::action_control::{
+    ActionControlHistoryResponse, ActionControlListResponse, ActionControlPutRequest,
+    SetError as ControlSetError, SetOutcome as ControlSetOutcome,
+};
+use crate::safety_checks::SafetyChecksByEntity;
+use xai_abuse_enforcement_types::action_control::{PodOffSwitchView, PodView};
+
+pub const UPDATED_BY_HEADER: &str = "x-updated-by";
+
+fn updated_by(
+    headers: &axum::http::HeaderMap,
+    body: Option<&str>,
+    key_id: &str,
+    cfg: &crate::action_control::ControlConfig,
+) -> String {
+    let named = |v: Option<&str>| {
+        v.map(str::trim)
+            .filter(|v| !v.is_empty())
+            .map(str::to_owned)
+    };
+    cfg.may_name_updater(key_id)
+        .then(|| {
+            named(headers.get(UPDATED_BY_HEADER).and_then(|v| v.to_str().ok()))
+                .or_else(|| named(body))
+        })
+        .flatten()
+        .unwrap_or_else(|| key_id.to_owned())
+}
+
+pub(crate) fn safety_checks_now(state: &AppState) -> SafetyChecksByEntity {
+    let status = |entity: EntityType| {
+        let rules = state.rules_cache.resolve(
+            entity,
+            state.dynamic_config.enforcement_rules_yaml(entity).as_ref(),
+        );
+        crate::safety_checks::status(entity, &rules)
+    };
+    SafetyChecksByEntity {
+        user: status(EntityType::User),
+        post: status(EntityType::Post),
+    }
+}
+
+#[utoipa::path(
+    get,
+    path = "/action_controls",
+    tag = "action_control",
+    security(("BearerAuth" = [])),
+    responses(
+        (status = 200, description = "Records, seen list and feature state", body = ActionControlListResponse),
+    ),
+)]
+#[tracing::instrument(skip_all)]
+pub async fn handle_action_controls_get(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let cfg = state.dynamic_config.action_control_config();
+    let resp = state
+        .action_control
+        .list(&cfg, safety_checks_now(&state))
+        .await;
+    (StatusCode::OK, Json(resp))
+}
+
+#[utoipa::path(
+    put,
+    path = "/action_controls",
+    tag = "action_control",
+    security(("BearerAuth" = [])),
+    request_body = ActionControlPutRequest,
+    responses(
+        (status = 200, description = "Stored record, previous record, harsher reasons"),
+        (status = 400, description = "Invalid request: {error: code, detail}"),
+        (status = 409, description = "version_conflict or lost_race, with the current record"),
+        (status = 500, description = "Manhattan write failed"),
+        (status = 503, description = "action_control.ignore_store is set"),
+    ),
+)]
+#[tracing::instrument(skip_all)]
+pub async fn handle_action_controls_put(
+    State(state): State<Arc<AppState>>,
+    Extension(actor): Extension<KeyId>,
+    method: Method,
+    uri: Uri,
+    headers: axum::http::HeaderMap,
+    Json(req): Json<ActionControlPutRequest>,
+) -> impl IntoResponse {
+    let cfg = state.dynamic_config.action_control_config();
+    let who = updated_by(&headers, req.updated_by.as_deref(), &actor.0, &cfg);
+    info!(
+        entity_type = req.entity_type.as_str(),
+        head = %req.head,
+        classifier = req.classifier.as_deref().unwrap_or(""),
+        band = req.band.as_deref().unwrap_or(""),
+        mode = req.mode.as_str(),
+        who = %who,
+        "PUT /api/action_controls"
+    );
+    if who.len() > 256 {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "updated_by_too_long", "detail": "who is longer than 256 bytes"})),
+        );
+    }
+    let request_json = serde_json::to_string(&req).unwrap_or_default();
+    let result = state
+        .action_control
+        .set(
+            req,
+            &who,
+            &actor.0,
+            crate::now_millis(),
+            &cfg,
+            &safety_checks_now(&state),
+        )
+        .await;
+    if !matches!(result, Err(ControlSetError::Invalid(..))) {
+        publish_admin_action_event(
+            state.kafka_producers.admin_actions(),
+            &action_control_admin_event(actor.0, &method, uri.path(), request_json, &result),
+        );
+    }
+    action_control_put_response(result)
+}
+
+pub(crate) fn action_control_put_response(
+    result: Result<ControlSetOutcome, ControlSetError>,
+) -> (StatusCode, Json<Value>) {
+    match result {
+        Ok(out) => (
+            StatusCode::OK,
+            Json(json!({
+                "record": out.view,
+                "before": out.before,
+                "harsher": !out.harsher_because.is_empty(),
+                "harsher_because": out.harsher_because,
+                "history_written": out.history_written,
+            })),
+        ),
+        Err(ControlSetError::Invalid(code, detail)) => (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": code, "detail": detail})),
+        ),
+        Err(ControlSetError::Conflict(current, current_version)) => (
+            StatusCode::CONFLICT,
+            Json(json!({
+                "error": "version_conflict",
+                "detail": "the stored version differs from expected_version; review the current record and try again",
+                "current": current,
+                "current_version": current_version,
+            })),
+        ),
+        Err(ControlSetError::LostRace(current)) => (
+            StatusCode::CONFLICT,
+            Json(json!({
+                "error": "lost_race",
+                "detail": "another change landed at the same moment and replaced this one; review the current record",
+                "current": current,
+            })),
+        ),
+        Err(ControlSetError::Ignored) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({
+                "error": "ignore_store",
+                "detail": "GrowthBook action_control.ignore_store is set; records are ignored and can't be written",
+            })),
+        ),
+        Err(ControlSetError::Store(e)) => {
+            error!("PUT /api/action_controls failed: {e}");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": "store", "detail": e})),
+            )
+        }
+    }
+}
+
+pub(crate) fn action_control_admin_event(
+    actor_key_id: String,
+    method: &Method,
+    path: &str,
+    request_json: String,
+    result: &Result<ControlSetOutcome, ControlSetError>,
+) -> AdminActionEvent {
+    let (success, error, before_json) = match result {
+        Ok(out) => (
+            true,
+            String::new(),
+            out.before
+                .as_ref()
+                .and_then(|b| serde_json::to_string(b).ok())
+                .unwrap_or_default(),
+        ),
+        Err(e) => (false, format!("{e:?}"), String::new()),
+    };
+    AdminActionEvent {
+        occurred_at_ms: crate::now_millis(),
+        action: AdminAction::Unspecified as i32,
+        actor_key_id,
+        environment: AUDIT_ENVIRONMENT.clone(),
+        http_method: method.to_string(),
+        http_path: path.to_string(),
+        success,
+        error,
+        request_json,
+        before_json,
+        ..Default::default()
+    }
+}
+
+#[derive(Debug, serde::Deserialize, utoipa::IntoParams)]
+pub struct HistoryQuery {
+    pub head: String,
+    #[serde(default)]
+    pub limit: Option<usize>,
+}
+
+#[utoipa::path(
+    get,
+    path = "/action_controls/history",
+    tag = "action_control",
+    security(("BearerAuth" = [])),
+    params(HistoryQuery),
+    responses(
+        (status = 200, description = "History entries", body = ActionControlHistoryResponse),
+        (status = 400, description = "Invalid head"),
+    ),
+)]
+#[tracing::instrument(skip_all)]
+pub async fn handle_action_controls_history(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Query(q): axum::extract::Query<HistoryQuery>,
+) -> impl IntoResponse {
+    if !crate::off_switch::valid_name(&q.head) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(
+                json!({"error": "invalid_head", "detail": "head must be 1-256 characters of [A-Za-z0-9_.:@-]"}),
+            ),
+        );
+    }
+    let resp = state
+        .action_control
+        .history(
+            &q.head,
+            q.limit
+                .unwrap_or(crate::action_control::HISTORY_LIMIT_DEFAULT),
+        )
+        .await;
+    (
+        StatusCode::OK,
+        Json(serde_json::to_value(resp).unwrap_or_default()),
+    )
+}
+
+#[utoipa::path(
+    get,
+    path = "/action_controls/pod",
+    tag = "action_control",
+    security(("BearerAuth" = [])),
+    responses(
+        (status = 200, description = "This pod's view", body = PodView),
+    ),
+)]
+#[tracing::instrument(skip_all)]
+pub async fn handle_action_controls_pod(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let bi = current_build_information();
+    let view = PodView {
+        pod: state.action_control.pod.clone(),
+        env: state.action_control.env.clone(),
+        image: bi.git_commit_sha.to_string(),
+        action_control: state.action_control.pod_view(),
+        off_switch: PodOffSwitchView {
+            snapshot_age_ms: state.off_switch.snapshot_age_ms().unwrap_or(-1),
+            active: state.off_switch.active_lkeys(crate::now_millis()),
+        },
+    };
+    (StatusCode::OK, Json(view))
+}
+
+
+use crate::backfill::{
+    BackfillRunChangeRequest, BackfillRunListResponse, BackfillRunRecord, BackfillRunStartRequest,
+    BackfillSettingsRequest, BackfillSettingsResponse, Change as RunChange, RunError, RunState,
+};
+
+fn run_person(headers: &axum::http::HeaderMap) -> Option<String> {
+    headers
+        .get(UPDATED_BY_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .filter(|v| !v.is_empty() && v.len() <= 256)
+        .map(str::to_owned)
+}
+
+fn run_error_response(e: RunError) -> (StatusCode, Json<Value>) {
+    match e {
+        RunError::Forbidden(code, detail) => (
+            StatusCode::FORBIDDEN,
+            Json(json!({"error": code, "detail": detail})),
+        ),
+        RunError::Invalid(code, detail) => (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": code, "detail": detail})),
+        ),
+        RunError::NotFound => (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": "not_found", "detail": "no run has this id"})),
+        ),
+        RunError::Conflict(code, detail, current) => (
+            StatusCode::CONFLICT,
+            Json(json!({"error": code, "detail": detail, "current": current})),
+        ),
+        RunError::SettingsConflict(code, detail, current) => (
+            StatusCode::CONFLICT,
+            Json(json!({"error": code, "detail": detail, "current": current})),
+        ),
+        RunError::Store(detail) => {
+            error!("backfill run store error: {detail}");
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({"error": "store", "detail": detail})),
+            )
+        }
+    }
+}
+
+fn run_admin_event(
+    actor_key_id: String,
+    method: &Method,
+    path: &str,
+    request_json: String,
+    result: Result<&BackfillRunRecord, &RunError>,
+) -> AdminActionEvent {
+    let (success, error) = match result {
+        Ok(_) => (true, String::new()),
+        Err(e) => (false, format!("{e:?}")),
+    };
+    AdminActionEvent {
+        occurred_at_ms: crate::now_millis(),
+        action: AdminAction::Unspecified as i32,
+        actor_key_id,
+        environment: AUDIT_ENVIRONMENT.clone(),
+        http_method: method.to_string(),
+        http_path: path.to_string(),
+        success,
+        error,
+        request_json,
+        ..Default::default()
+    }
+}
+
+#[derive(Debug, Default, serde::Deserialize, utoipa::IntoParams)]
+pub struct RunListQuery {
+        #[serde(default)]
+    pub state: Option<String>,
+        #[serde(default)]
+    pub entity: Option<String>,
+    #[serde(default)]
+    pub head: Option<String>,
+}
+
+#[utoipa::path(
+    get,
+    path = "/backfill_runs",
+    tag = "backfill_runs",
+    security(("BearerAuth" = [])),
+    params(RunListQuery),
+    responses(
+        (status = 200, description = "Runs", body = BackfillRunListResponse),
+        (status = 503, description = "Store unreachable"),
+    ),
+)]
+#[tracing::instrument(skip_all)]
+pub async fn handle_backfill_runs_list(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Query(q): axum::extract::Query<RunListQuery>,
+) -> impl IntoResponse {
+    let runs = match state.backfill.list().await {
+        Ok(runs) => runs,
+        Err(e) => return run_error_response(RunError::Store(e.to_string())),
+    };
+    let states: Option<Vec<String>> = q.state.as_deref().map(|s| {
+        s.split(',')
+            .map(|x| x.trim().to_owned())
+            .filter(|x| !x.is_empty())
+            .collect()
+    });
+    let runs: Vec<BackfillRunRecord> = runs
+        .into_iter()
+        .filter(|r| {
+            states
+                .as_ref()
+                .is_none_or(|ss| ss.iter().any(|s| s == r.state.as_str()))
+                && q.entity.as_deref().is_none_or(|e| e == r.entity.as_str())
+                && q.head.as_deref().is_none_or(|h| h == r.head)
+        })
+        .map(|r| state.backfill.as_served(r))
+        .collect();
+    (
+        StatusCode::OK,
+        Json(serde_json::to_value(BackfillRunListResponse { runs }).unwrap_or_default()),
+    )
+}
+
+#[utoipa::path(
+    get,
+    path = "/backfill_runs/budget",
+    tag = "backfill_runs",
+    security(("BearerAuth" = [])),
+    responses(
+        (status = 200, description = "Budget per entity and the speed limit"),
+        (status = 503, description = "Store unreachable"),
+    ),
+)]
+#[tracing::instrument(skip_all)]
+pub async fn handle_backfill_runs_budget(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    match state.backfill.config_fresh().await {
+        Ok(cfg) => (
+            StatusCode::OK,
+            Json(json!({
+                "user": cfg.budget(EntityType::User),
+                "post": cfg.budget(EntityType::Post),
+                "max_rate_per_sec": cfg.max_rate_per_sec,
+            })),
+        ),
+        Err(e) => run_error_response(e),
+    }
+}
+
+#[utoipa::path(
+    get,
+    path = "/backfill_settings",
+    tag = "backfill_runs",
+    security(("BearerAuth" = [])),
+    responses(
+        (status = 200, description = "The settings", body = BackfillSettingsResponse),
+        (status = 503, description = "Store unreachable"),
+    ),
+)]
+#[tracing::instrument(skip_all)]
+pub async fn handle_backfill_settings_get(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    match state.backfill.settings().await {
+        Ok(s) => (
+            StatusCode::OK,
+            Json(serde_json::to_value(s).unwrap_or_default()),
+        ),
+        Err(e) => run_error_response(e),
+    }
+}
+
+#[utoipa::path(
+    put,
+    path = "/backfill_settings",
+    tag = "backfill_runs",
+    security(("BearerAuth" = [])),
+    request_body = BackfillSettingsRequest,
+    responses(
+        (status = 200, description = "The settings after the change", body = BackfillSettingsResponse),
+        (status = 400, description = "confirm_required, bad_rate, bad_budget or bad_reason"),
+        (status = 403, description = "not_page_key or person_required"),
+        (status = 409, description = "version_conflict or lost_race, with the current settings"),
+        (status = 503, description = "Store unreachable"),
+    ),
+)]
+#[tracing::instrument(skip_all)]
+pub async fn handle_backfill_settings_put(
+    State(state): State<Arc<AppState>>,
+    Extension(actor): Extension<KeyId>,
+    method: Method,
+    uri: Uri,
+    headers: axum::http::HeaderMap,
+    Json(req): Json<BackfillSettingsRequest>,
+) -> impl IntoResponse {
+    let who = run_person(&headers);
+    info!(
+        who = who.as_deref().unwrap_or(""),
+        key_id = %actor.0,
+        user = req.max_user_decisions_per_day,
+        post = req.max_post_decisions_per_day,
+        rate = req.max_rate_per_sec,
+        "PUT /api/backfill_settings"
+    );
+    let request_json = serde_json::to_string(&req).unwrap_or_default();
+    let result = state
+        .backfill
+        .set_settings(req, who.as_deref(), &actor.0, crate::now_millis())
+        .await;
+    if !matches!(result, Err(RunError::Invalid(..))) {
+        let (success, error) = match &result {
+            Ok(_) => (true, String::new()),
+            Err(e) => (false, format!("{e:?}")),
+        };
+        publish_admin_action_event(
+            state.kafka_producers.admin_actions(),
+            &AdminActionEvent {
+                occurred_at_ms: crate::now_millis(),
+                action: AdminAction::Unspecified as i32,
+                actor_key_id: actor.0,
+                environment: AUDIT_ENVIRONMENT.clone(),
+                http_method: method.to_string(),
+                http_path: uri.path().to_string(),
+                success,
+                error,
+                request_json,
+                ..Default::default()
+            },
+        );
+    }
+    match result {
+        Ok(s) => (
+            StatusCode::OK,
+            Json(serde_json::to_value(s).unwrap_or_default()),
+        ),
+        Err(e) => run_error_response(e),
+    }
+}
+
+#[utoipa::path(
+    get,
+    path = "/backfill_runs/{run_id}",
+    tag = "backfill_runs",
+    security(("BearerAuth" = [])),
+    params(("run_id" = String, Path, description = "The run's id")),
+    responses(
+        (status = 200, description = "The run", body = BackfillRunRecord),
+        (status = 404, description = "No such run"),
+        (status = 503, description = "Store unreachable"),
+    ),
+)]
+#[tracing::instrument(skip_all)]
+pub async fn handle_backfill_run_get(
+    State(state): State<Arc<AppState>>,
+    Path(run_id): Path<String>,
+) -> impl IntoResponse {
+    match state.backfill.run(&run_id).await {
+        Ok(Some(rec)) => (
+            StatusCode::OK,
+            Json(serde_json::to_value(state.backfill.as_served(rec)).unwrap_or_default()),
+        ),
+        Ok(None) => run_error_response(RunError::NotFound),
+        Err(e) => run_error_response(RunError::Store(e.to_string())),
+    }
+}
+
+#[utoipa::path(
+    post,
+    path = "/backfill_runs",
+    tag = "backfill_runs",
+    security(("BearerAuth" = [])),
+    request_body = BackfillRunStartRequest,
+    responses(
+        (status = 201, description = "Run started", body = BackfillRunRecord),
+        (status = 200, description = "The same run, already started", body = BackfillRunRecord),
+        (status = 400, description = "Invalid request: {error: code, detail}"),
+        (status = 403, description = "not_page_key or person_required"),
+        (status = 409, description = "changed_since_you_looked, run_in_progress, run_id_conflict, weak_evidence, switched_off, settings_not_set or lost_race"),
+        (status = 503, description = "Store unreachable"),
+    ),
+)]
+#[tracing::instrument(skip_all)]
+pub async fn handle_backfill_run_start(
+    State(state): State<Arc<AppState>>,
+    Extension(actor): Extension<KeyId>,
+    method: Method,
+    uri: Uri,
+    headers: axum::http::HeaderMap,
+    Json(req): Json<BackfillRunStartRequest>,
+) -> impl IntoResponse {
+    let who = run_person(&headers);
+    info!(
+        run_id = %req.run_id,
+        head = %req.head,
+        entity = req.entity.as_str(),
+        who = who.as_deref().unwrap_or(""),
+        key_id = %actor.0,
+        "POST /api/backfill_runs"
+    );
+    let request_json = serde_json::to_string(&req).unwrap_or_default();
+    let result = match state.backfill.config_fresh().await {
+        Ok(cfg) => {
+            state
+                .backfill
+                .start(
+                    req,
+                    who.as_deref(),
+                    &actor.0,
+                    &cfg,
+                    &state.action_control,
+                    &state.dynamic_config.action_control_config(),
+                    &state.off_switch,
+                    crate::now_millis(),
+                )
+                .await
+        }
+        Err(e) => Err(e),
+    };
+    if !matches!(result, Err(RunError::Invalid(..))) {
+        publish_admin_action_event(
+            state.kafka_producers.admin_actions(),
+            &run_admin_event(
+                actor.0,
+                &method,
+                uri.path(),
+                request_json,
+                result.as_ref().map(|(r, _)| r),
+            ),
+        );
+    }
+    match result {
+        Ok((rec, created)) => (
+            if created {
+                StatusCode::CREATED
+            } else {
+                StatusCode::OK
+            },
+            Json(serde_json::to_value(rec).unwrap_or_default()),
+        ),
+        Err(e) => run_error_response(e),
+    }
+}
+
+#[utoipa::path(
+    post,
+    path = "/backfill_runs/{run_id}/{change}",
+    tag = "backfill_runs",
+    security(("BearerAuth" = [])),
+    params(
+        ("run_id" = String, Path, description = "The run's id"),
+        ("change" = String, Path, description = "pause, resume, stop or done"),
+    ),
+    request_body = BackfillRunChangeRequest,
+    responses(
+        (status = 200, description = "The run after the change", body = BackfillRunRecord),
+        (status = 400, description = "confirm_required"),
+        (status = 403, description = "key_not_allowed or person_required"),
+        (status = 404, description = "No such run or change"),
+        (status = 409, description = "version_conflict, not_running, not_paused, already_final, switched_off, weak_evidence or lost_race"),
+        (status = 503, description = "Store unreachable"),
+    ),
+)]
+#[tracing::instrument(skip_all)]
+pub async fn handle_backfill_run_change(
+    State(state): State<Arc<AppState>>,
+    Extension(actor): Extension<KeyId>,
+    method: Method,
+    uri: Uri,
+    headers: axum::http::HeaderMap,
+    Path((run_id, change)): Path<(String, String)>,
+    Json(req): Json<BackfillRunChangeRequest>,
+) -> impl IntoResponse {
+    let change = match change.as_str() {
+        "pause" => RunChange::Pause,
+        "resume" => RunChange::Resume,
+        "stop" => RunChange::Stop,
+        "done" => RunChange::Done,
+        _ => return run_error_response(RunError::NotFound),
+    };
+    let who = run_person(&headers);
+    info!(
+        run_id = %run_id,
+        change = change.as_str(),
+        who = who.as_deref().unwrap_or(""),
+        key_id = %actor.0,
+        "POST /api/backfill_runs/{{run_id}}/{{change}}"
+    );
+    let request_json = serde_json::to_string(&req).unwrap_or_default();
+    let result = state
+        .backfill
+        .change(
+            &run_id,
+            change,
+            req,
+            who.as_deref(),
+            &actor.0,
+            &state.backfill.config(),
+            &state.action_control,
+            &state.dynamic_config.action_control_config(),
+            &state.off_switch,
+            crate::now_millis(),
+        )
+        .await;
+    if !matches!(result, Err(RunError::Invalid(..))) {
+        publish_admin_action_event(
+            state.kafka_producers.admin_actions(),
+            &run_admin_event(actor.0, &method, uri.path(), request_json, result.as_ref()),
+        );
+    }
+    match result {
+        Ok(rec) => {
+            if rec.state == RunState::Stopped {
+                info!(run_id = %rec.run_id, by = %rec.state_changed_by, "backfill run stopped");
+            }
+            (
+                StatusCode::OK,
+                Json(serde_json::to_value(rec).unwrap_or_default()),
+            )
+        }
+        Err(e) => run_error_response(e),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_allowed_keys_name_the_updater() {
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(UPDATED_BY_HEADER, "a@example.com".parse().unwrap());
+        let any = crate::action_control::ControlConfig::default();
+        assert_eq!(
+            updated_by(&headers, Some("b@example.com"), "pv2", &any),
+            "a@example.com"
+        );
+        assert_eq!(
+            updated_by(&Default::default(), Some(" b@example.com "), "pv2", &any),
+            "b@example.com"
+        );
+        assert_eq!(
+            updated_by(&Default::default(), Some(" "), "pv2", &any),
+            "pv2"
+        );
+        let page_only = crate::action_control::ControlConfig::from_config(Some(&json!({
+            "action_control": {"updated_by_keys": ["pv2"]}
+        })));
+        assert_eq!(
+            updated_by(&headers, None, "pv2", &page_only),
+            "a@example.com"
+        );
+        assert_eq!(
+            updated_by(&headers, Some("b@example.com"), "dev", &page_only),
+            "dev"
+        );
+        for malformed in [json!("pv2"), json!({"pv2": true}), json!(["pv2", 7])] {
+            let cfg = crate::action_control::ControlConfig::from_config(Some(&json!({
+                "action_control": {"updated_by_keys": malformed.clone()}
+            })));
+            assert_eq!(
+                updated_by(&headers, None, "pv2", &cfg),
+                "pv2",
+                "{malformed}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn off_switch_put_audit_event_carries_actor_body_and_prior_state() {
+        use crate::off_switch::OffSwitchRecord;
+        use crate::off_switch::test_support::{loaded, record};
+        let (sw, _) = loaded(&[record("H", None, true, None)]).await;
+        let req = OffSwitchPutRequest {
+            head: "H".into(),
+            classifier: None,
+            off: false,
+            reason: "fixed".into(),
+            auto_on_at_ms: None,
+            updated_by: Some("operator@example.com".into()),
+        };
+        let request_json = serde_json::to_string(&req).unwrap();
+        let result = sw.set(req, "pv2", crate::now_millis()).await;
+        let ev = off_switch_admin_event(
+            "pv2".into(),
+            &Method::PUT,
+            "/api/off_switches",
+            request_json.clone(),
+            &result,
+        );
+        assert!(ev.success);
+        assert_eq!(ev.error, "");
+        assert_eq!(ev.actor_key_id, "pv2");
+        assert_eq!(ev.http_method, "PUT");
+        assert_eq!(ev.http_path, "/api/off_switches");
+        assert_eq!(ev.request_json, request_json);
+        let before: OffSwitchRecord = serde_json::from_str(&ev.before_json).unwrap();
+        assert!(before.off, "prior state is the switch that was off");
+
+        let failed: Result<SetOutcome, SetError> = Err(SetError::Store("timeout".into()));
+        let ev = off_switch_admin_event(
+            "pv2".into(),
+            &Method::PUT,
+            "/api/off_switches",
+            String::new(),
+            &failed,
+        );
+        assert!(!ev.success);
+        assert_eq!(ev.error, "timeout");
+        assert_eq!(ev.before_json, "");
+    }
 
     #[test]
     fn truncate_utf8_does_not_split_multibyte_chars() {
@@ -2562,6 +3465,55 @@ mod tests {
         assert_eq!(captcha.actor_header(), plugin_header);
         let liveness = EnforcementAction::spam_liveness_check(42, vec![]);
         assert_eq!(liveness.actor_header(), plugin_header);
+    }
+
+    #[test]
+    fn phoenix_skip_label_encodes_as_label_value_118() {
+        use xai_abuse_thrift_codec::{SCHEMA_AIS, Transcoder};
+        let t = Transcoder::from_schema_bytes(SCHEMA_AIS).unwrap();
+        let method = t
+            .lookup_method(
+                "com.twitter.agenttools.ais.thriftscala.ActionIntakeService",
+                "intakeAction",
+            )
+            .expect("intakeAction");
+        let action = EnforcementAction::from_spec(
+            &ActionSpec::AddLabelsV2 {
+                labels: vec![crate::gizmoduck_labels::CLIENT_EVENT_PHOENIX_SKIP.into()],
+                ttl_msec: Some(30 * 86_400_000),
+            },
+            9,
+            9,
+            vec!["head: AdsRenderBot".into()],
+        );
+        assert_eq!(
+            action.actor_header(),
+            json!({"plugin": {"pluginId": PLUGIN_ID}})
+        );
+        let payload = build_intake_request(
+            action.actor_header(),
+            action.to_json(),
+            AIS_TOOL,
+            Some(action.audit_note()),
+        );
+        let encode = |p: &Value| {
+            t.encode_call(
+                method.thrift_method_name,
+                method.arg_field_name,
+                method.arg_field_id,
+                method.request_type,
+                p,
+                1,
+            )
+        };
+        let label_id = "/action/addLabelsV2/labels/0/nonPolicyBasedLabel/label/labelReferenceWithSafetyLabel/labelReference/labelIdType/nativeUserLabels";
+        assert_eq!(
+            payload.pointer(label_id),
+            Some(&json!("ClientEventPhoenixSkip"))
+        );
+        let mut by_ordinal = payload.clone();
+        *by_ordinal.pointer_mut(label_id).unwrap() = json!(118);
+        assert_eq!(encode(&payload).unwrap(), encode(&by_ordinal).unwrap());
     }
 
 

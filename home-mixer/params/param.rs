@@ -1,4 +1,4 @@
-// mirrored from config feature-switch defaults; last sync 2026-10-08T16:00:35Z
+// mirrored from config feature-switch defaults; last sync 2026-10-21T16:00:32Z
 use xai_feature_switches::param;
 
 param!(
@@ -77,6 +77,12 @@ param!(
     false
 );
 param!(
+    PhoenixOonRepliesRootOnly,
+    bool,
+    "rust_home_mixer_phoenix_oon_replies_root_only",
+    false
+);
+param!(
     ShadowTrafficPhoenixClustersList,
     Vec<String>,
     "rust_home_mixer_shadow_traffic_phoenix_clusters_list",
@@ -92,7 +98,13 @@ param!(
     ShadowTrafficPhoenixClusterRates,
     Vec<String>,
     "rust_home_mixer_shadow_traffic_phoenix_cluster_rates",
-    vec![]
+    vec!["Experiment18Fou:0.5".to_string()]
+);
+param!(
+    ShadowTrafficPhoenixClusterAggregationTypes,
+    Vec<String>,
+    "rust_home_mixer_shadow_traffic_phoenix_cluster_aggregation_types",
+    vec!["Experiment16Fou:DENSE_WITH_LONG_DWELL_HOME_EXCURSION".to_string()]
 );
 param!(
     ShadowTrafficDefaultPercent,
@@ -221,6 +233,24 @@ param!(
     "rust_home_mixer_author_is_treatment",
     false
 );
+param!(
+    ViewerZeroFavCodivertIsTreatment,
+    bool,
+    "rust_home_mixer_viewer_zero_fav_codivert_is_treatment",
+    false
+);
+param!(
+    AuthorZeroFavCodivertIsTreatment,
+    bool,
+    "rust_home_mixer_author_zero_fav_codivert_is_treatment",
+    false
+);
+param!(
+    AuthorZeroFavCodivertIsControl,
+    bool,
+    "rust_home_mixer_author_zero_fav_codivert_is_control",
+    false
+);
 
 param!(
     PhoenixRetrievalNewUserInferenceClusterId,
@@ -240,18 +270,19 @@ param!(
     "rust_home_mixer_phoenix_xds_retrieval_max_retries",
     0
 );
-param!(
-    EnablePhoenixRetrievalFallback,
-    bool,
-    "rust_home_mixer_phoenix_retrieval_enable_fallback",
-    false
-);
 
 param!(
     PhoenixRetrievalExcludeSeenPosts,
     bool,
     "rust_home_mixer_phoenix_retrieval_exclude_seen_posts",
     false
+);
+
+param!(
+    RetrievalValueModelWeights,
+    String,
+    "rust_home_mixer_retrieval_value_model_weights",
+    ""
 );
 
 param!(
@@ -311,7 +342,7 @@ param!(
 // navigating to a post (i.e., coordinating via groupchat) has no
 // ranking impact. And users cannot manufacture a post to show up in
 // their Timeline in any consistently reproducible way.
-param!(FavoriteWeight, f64, "rust_home_mixer_favorite_weight", 0.5);
+param!(FavoriteWeight, f64, "rust_home_mixer_favorite_weight", 0.66);
 param!(ReplyWeight, f64, "rust_home_mixer_reply_weight", 5.0);
 param!(
     BidirectionalFollowReplyWeightBoost,
@@ -336,7 +367,7 @@ param!(
     VideoOpenWeight,
     f64,
     "rust_home_mixer_video_open_weight",
-    0.07
+    0.02
 );
 param!(ClickWeight, f64, "rust_home_mixer_click_weight", 0.3);
 param!(OpenLinkWeight, f64, "rust_home_mixer_open_link_weight", 0.2);
@@ -387,10 +418,16 @@ param!(
     0.015
 );
 param!(
+    ReactWithVideoWeight,
+    f64,
+    "rust_home_mixer_react_with_video_weight",
+    0.0
+);
+param!(
     ContDwellTimeWeight,
     f64,
     "rust_home_mixer_cont_dwell_time_weight",
-    0.004
+    0.006
 );
 param!(
     ContClickDwellTimeWeight,
@@ -403,7 +440,7 @@ param!(
     NotInterestedWeight,
     f64,
     "rust_home_mixer_not_interested_weight",
-    -47.52
+    -52.272
 );
 param!(
     BlockAuthorWeight,
@@ -472,6 +509,30 @@ param!(
     VMRankerSendPacingInputs,
     bool,
     "rust_home_mixer_vm_ranker_send_pacing_inputs",
+    false
+);
+param!(
+    VMRankerSendHistoryTopics,
+    bool,
+    "rust_home_mixer_vm_ranker_send_history_topics",
+    false
+);
+param!(
+    HistoryTopicsEnabled,
+    bool,
+    "rust_home_mixer_history_topics_enabled",
+    false
+);
+param!(
+    HistoryTopicsWindowDays,
+    i64,
+    "rust_home_mixer_history_topics_window_days",
+    28
+);
+param!(
+    EnableSerendipityStatsExperimentBucket,
+    bool,
+    "rust_home_mixer_enable_serendipity_stats_experiment_bucket",
     false
 );
 param!(
@@ -741,6 +802,18 @@ param!(
     1800
 );
 param!(
+    EnableNewUserSoftNsfwFilter,
+    bool,
+    "rust_home_mixer_enable_new_user_soft_nsfw_filter",
+    false
+);
+param!(
+    NewUserSoftNsfwFilterMaxAccountAgeSecs,
+    u64,
+    "rust_home_mixer_new_user_soft_nsfw_filter_max_account_age_secs",
+    86400
+);
+param!(
     NewUserMinEngagementFilterMaxResurrectionAgeSecs,
     u64,
     "rust_home_mixer_new_user_min_engagement_filter_max_resurrection_age_secs",
@@ -751,6 +824,12 @@ param!(
     bool,
     "rust_home_mixer_enable_engagement_counts_hydration",
     true
+);
+param!(
+    EnablePostEngagers,
+    bool,
+    "rust_home_mixer_enable_post_engagers",
+    false
 );
 param!(
     EnableSemanticIdHydration,
@@ -796,7 +875,7 @@ param!(
     EnableAdsAuthorBrandSafetyFallback,
     bool,
     "rust_home_mixer_ads_bs_author_fallback_enabled",
-    false
+    true
 );
 param!(
     AdsTimeGapTSec,
@@ -1056,6 +1135,60 @@ param!(
     "rust_home_mixer_video_carousel_position",
     6
 );
+param!(
+    EnableVideoCarouselAuthorDedupe,
+    bool,
+    "rust_home_mixer_enable_video_carousel_author_dedupe",
+    true
+);
+param!(
+    VideoCarouselSemanticIdDedupeLevels,
+    u32,
+    "rust_home_mixer_video_carousel_semantic_id_dedupe_levels",
+    3
+);
+param!(
+    EnableVideoCarouselEmbeddingDedupe,
+    bool,
+    "rust_home_mixer_enable_video_carousel_embedding_dedupe",
+    true
+);
+param!(
+    VideoCarouselEmbeddingDedupeThreshold,
+    f64,
+    "rust_home_mixer_video_carousel_embedding_dedupe_threshold",
+    0.72
+);
+param!(
+    EnableVideoCarouselCandidatesLogging,
+    bool,
+    "rust_home_mixer_enable_video_carousel_candidates_logging",
+    true
+);
+param!(
+    VideoCarouselVideoOpenWeight,
+    f64,
+    "rust_home_mixer_video_carousel_video_open_weight",
+    1.0
+);
+param!(
+    VideoCarouselImmersiveVqvWeight,
+    f64,
+    "rust_home_mixer_video_carousel_immersive_vqv_weight",
+    0.0
+);
+param!(
+    VideoCarouselImmersiveClusterId,
+    String,
+    "rust_home_mixer_video_carousel_immersive_cluster_id",
+    "Experiment3Fou"
+);
+param!(
+    VideoCarouselImmersiveAggregationType,
+    String,
+    "rust_home_mixer_video_carousel_immersive_aggregation_type",
+    "IMMERSIVE_LONG_DWELL"
+);
 
 param!(
     EnableXaiVfClient,
@@ -1069,4 +1202,10 @@ param!(
     u32,
     "rust_home_mixer_phoenix_scores_result_size",
     2800
+);
+param!(
+    EnableFairShareRanking,
+    bool,
+    "rust_home_mixer_enable_fair_share_ranking",
+    true
 );

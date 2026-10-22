@@ -28,31 +28,35 @@ const VF_XDS_BUILD_TIMEOUT: Duration = Duration::from_secs(10);
 
 const VF_XDS_EAGER_RESOLUTION_TIMEOUT: Duration = Duration::from_secs(5);
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+const VF_READINESS_PROBE_PORT: u16 = 9090;
+
+const VF_READINESS_PROBE_PATH: &str = "/readyz";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum VfDiscovery {
-    #[default]
     Wily,
     Xds,
 }
 
 impl VfDiscovery {
-    pub(crate) fn parse(env_name: &str, value: Option<&str>) -> Self {
+    pub(crate) fn parse(env_name: &str, value: Option<&str>, default: Self) -> Self {
         match value.map(|v| v.trim().to_ascii_lowercase()).as_deref() {
             Some("xds") => Self::Xds,
-            None | Some("") | Some("wily") => Self::Wily,
+            Some("wily") => Self::Wily,
+            None | Some("") => default,
             Some(other) => {
                 warn!(
                     value = other,
                     env = env_name,
-                    "unrecognized VF discovery mode; defaulting to wily"
+                    "unrecognized VF discovery mode; defaulting to {default:?}"
                 );
-                Self::Wily
+                default
             }
         }
     }
 
-    pub(crate) fn from_env(env_name: &str) -> Self {
-        Self::parse(env_name, std::env::var(env_name).ok().as_deref())
+    pub(crate) fn from_env(env_name: &str, default: Self) -> Self {
+        Self::parse(env_name, std::env::var(env_name).ok().as_deref(), default)
     }
 }
 
@@ -124,39 +128,43 @@ pub(crate) enum VfChannel {
 pub(crate) async fn build_vf_channel(
     params: &VfChannelParams<'_>,
 ) -> Result<VfChannel, VfChannelError> {
-    let name = params.name;
     match params.discovery {
         VfDiscovery::Wily => Ok(VfChannel::Wily(build_vf_wily_channel(params).await?)),
-        VfDiscovery::Xds => {
-            let listener = vf_xds_listener_from_env();
-            let result = match tokio::time::timeout(
-                VF_XDS_BUILD_TIMEOUT,
-                build_xds_channel(params, &listener),
-            )
-            .await
-            {
-                Ok(result) => result,
-                Err(_) => Err(VfChannelError::Connect(anyhow::anyhow!(
-                    "timed out after {}s",
-                    VF_XDS_BUILD_TIMEOUT.as_secs()
-                ))),
-            };
-            match result {
-                Ok(channel) => {
-                    incr_build_metric(name, "xds", "built");
-                    Ok(VfChannel::Xds(channel))
-                }
-                Err(e) => {
-                    warn!(
-                        channel = name,
-                        listener = %listener,
-                        error = %e,
-                        "VF xDS channel build failed"
-                    );
-                    incr_build_metric(name, "xds", "failed");
-                    Err(e)
-                }
-            }
+        VfDiscovery::Xds => Ok(VfChannel::Xds(build_vf_xds_channel(params).await?)),
+    }
+}
+
+pub(crate) async fn build_vf_xds_channel(
+    params: &VfChannelParams<'_>,
+) -> Result<LoadBalancedChannel, VfChannelError> {
+    let name = params.name;
+    let listener = vf_xds_listener_from_env();
+    let result = match tokio::time::timeout(
+        VF_XDS_BUILD_TIMEOUT,
+        build_xds_channel(params, &listener),
+    )
+    .await
+    {
+        Ok(result) => result,
+        Err(_) => Err(VfChannelError::Connect(anyhow::anyhow!(
+            "timed out after {}s",
+            VF_XDS_BUILD_TIMEOUT.as_secs()
+        ))),
+    };
+    match result {
+        Ok(channel) => {
+            incr_build_metric(name, "xds", "built");
+            Ok(channel)
+        }
+        Err(e) => {
+            warn!(
+                channel = name,
+                listener = %listener,
+                error = %e,
+                "VF xDS channel build failed"
+            );
+            incr_build_metric(name, "xds", "failed");
+            Err(e)
         }
     }
 }
@@ -238,6 +246,7 @@ async fn build_xds_channel(
             e => VfChannelError::Connect(e.into()),
         })?
         .eager_resolution(VF_XDS_EAGER_RESOLUTION_TIMEOUT)
+        .readiness_probe(VF_READINESS_PROBE_PORT, VF_READINESS_PROBE_PATH)
         .buffer_max_wait(DEFAULT_BUFFER_MAX_WAIT)
         .total_timeout(DEFAULT_TOTAL_TIMEOUT)
         .aperture(params.aperture_size);
@@ -265,18 +274,20 @@ mod tests {
     const ENV: &str = "VF_TEST_DISCOVERY";
 
     #[test]
-    fn discovery_parse_defaults_to_wily() {
-        assert_eq!(VfDiscovery::parse(ENV, None), VfDiscovery::Wily);
-        assert_eq!(VfDiscovery::parse(ENV, Some("")), VfDiscovery::Wily);
-        assert_eq!(VfDiscovery::parse(ENV, Some("wily")), VfDiscovery::Wily);
-        assert_eq!(VfDiscovery::parse(ENV, Some("bogus")), VfDiscovery::Wily);
-        assert_eq!(VfDiscovery::default(), VfDiscovery::Wily);
-    }
-
-    #[test]
-    fn discovery_parse_xds_opt_in() {
-        assert_eq!(VfDiscovery::parse(ENV, Some("xds")), VfDiscovery::Xds);
-        assert_eq!(VfDiscovery::parse(ENV, Some(" XDS ")), VfDiscovery::Xds);
+    fn discovery_parse_uses_default_unless_mode_is_explicit() {
+        for default in [VfDiscovery::Wily, VfDiscovery::Xds] {
+            assert_eq!(VfDiscovery::parse(ENV, None, default), default);
+            assert_eq!(VfDiscovery::parse(ENV, Some(""), default), default);
+            assert_eq!(VfDiscovery::parse(ENV, Some("bogus"), default), default);
+        }
+        assert_eq!(
+            VfDiscovery::parse(ENV, Some("wily"), VfDiscovery::Xds),
+            VfDiscovery::Wily
+        );
+        assert_eq!(
+            VfDiscovery::parse(ENV, Some(" XDS "), VfDiscovery::Wily),
+            VfDiscovery::Xds
+        );
     }
 
     #[test]

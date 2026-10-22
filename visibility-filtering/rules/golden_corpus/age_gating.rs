@@ -3,8 +3,8 @@ use super::builders::{
 };
 use super::{Role, Row};
 use crate::models::{
-    HydratedTweetCandidate, NsfwViewerDropReason, SafetyLabelType, Viewer, ViewerAge,
-    ViewerFeatures, ViewerProfile,
+    NsfwViewerDropReason, PostCandidate, SafetyLabelType, Viewer, ViewerAge, ViewerFeatures,
+    ViewerProfile,
 };
 use crate::rules::fixtures::{
     allow, blurred, candidate, dropped, legacy_interstitial, nsfw_viewer_dropped,
@@ -179,6 +179,11 @@ pub(super) fn rows() -> Vec<Row> {
                     legacy_interstitial("nsfw_high_precision/legacy_interstitial"),
                 ),
                 (
+                    TimelineHomeHydration,
+                    Role::InnerQuoted(Box::new(Role::NonFollower)),
+                    legacy_interstitial("nsfw_high_precision/legacy_interstitial"),
+                ),
+                (
                     ImmersiveExpandedRecommendations,
                     Role::As("sensitive_opt_in", sensitive_opt_in_viewer()),
                     allow(),
@@ -245,12 +250,13 @@ pub(super) fn rows() -> Vec<Row> {
         },
         Row {
             name: "nsfw_user_flag_media_retweet",
-            post: HydratedTweetCandidate {
-                source_tweet_id: Some(2),
-                ..tweet_candidate(|t| {
+            post: {
+                let mut candidate = tweet_candidate(|t| {
                     t.nsfw.user = true;
                     t.media.has_media = true;
-                })
+                });
+                candidate.post.source_tweet_id = Some(2);
+                candidate
             },
             expect: vec![(
                 TimelineHome,
@@ -264,6 +270,6 @@ pub(super) fn rows() -> Vec<Row> {
     ]
 }
 
-fn labeled_media(label: SafetyLabelType) -> HydratedTweetCandidate {
+fn labeled_media(label: SafetyLabelType) -> PostCandidate {
     candidate().with_label(label).with_media().build()
 }

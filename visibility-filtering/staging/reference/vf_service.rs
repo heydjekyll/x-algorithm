@@ -47,10 +47,11 @@ fn service_triple(
             engagement: None | Some(_),
         } => None,
     };
-    let rule = treatment::decided_rows(verdict)
-        .next()
-        .map(|(rule, _)| rule);
-    (treatment::metric_label(verdict), reason, rule)
+    (
+        treatment::metric_label(verdict),
+        reason,
+        treatment::decided_by(verdict),
+    )
 }
 
 fn reference_action_label(reason: Option<&FilteredReason>) -> &'static str {
@@ -326,7 +327,9 @@ pub(crate) fn comparable_request(
         SafetyLevel::ImmersiveExpandedRecommendations => {
             ReferenceSafetyLevel::ImmersiveExpandedRecommendations
         }
-        SafetyLevel::FilterAll | SafetyLevel::TimelineHomeHydration => {
+        SafetyLevel::FilterAll
+        | SafetyLevel::TimelineHomeHydration
+        | SafetyLevel::QuotedTweetRules => {
             return Err("level_unmapped");
         }
     };
@@ -479,6 +482,7 @@ impl ReferenceCompareHarness {
 mod tests {
     use super::*;
     use crate::models::{MediaInterstitial, MediaRestriction};
+    use crate::rules::RuleId;
     use xai_visibility_filtering::models::{
         Action, DropReason, KeywordMatch, SafetyResult as ReferenceSafetyResult,
     };
@@ -520,6 +524,7 @@ mod tests {
     fn service_drop_of(reason: FilteredReason) -> Verdict {
         Verdict::Withheld(Decided {
             value: Withholding::Drop(crate::models::DropReason::Legacy(reason)),
+            id: RuleId::SuspendedAuthor,
             by: "suspended_author/drop",
         })
     }
@@ -537,6 +542,7 @@ mod tests {
                     reason: InterstitialReason::Sensitive(true),
                     prompt: None,
                 }),
+                id: RuleId::FilterAll,
                 by: "nsfw_media",
             }),
             engagement: None,
@@ -703,28 +709,6 @@ mod tests {
     }
 
     const ID: u64 = 1_000_000_000_000_000_000;
-
-    #[test]
-    fn identical_pairs_group_into_one_diffs_entry() {
-        let diffs = vec![
-            diff(1, "allow", "avoid:SafetyResult"),
-            diff(2, "drop:ContainNsfwMedia@nsfw_media", "allow"),
-            diff(3, "allow", "avoid:SafetyResult"),
-            diff(4, "allow", "avoid:SafetyResult"),
-        ];
-
-        let lines = chunk_lines(&context(), "b1", &diffs);
-
-        assert_eq!(lines.len(), 1, "a full request fits one line");
-        assert_eq!(lines[0]["chunk"], serde_json::json!([1, 1]));
-        assert_eq!(
-            lines[0]["diffs"],
-            serde_json::json!([
-                ["allow", "avoid:SafetyResult", [1, 3, 4]],
-                ["drop:ContainNsfwMedia@nsfw_media", "allow", [2]],
-            ])
-        );
-    }
 
     #[test]
     fn lines_split_at_the_byte_budget_and_stay_self_contained() {

@@ -192,7 +192,9 @@ class PallasRankerVarlenAttention(CustomAttention):
 
 
 class CutedslRankerAttention(CustomAttention):
-    def sharded_custom_op_with_extra_args(self):
+    supports_candidate_only = True
+
+    def sharded_custom_op_with_extra_args(self, **kwargs):
         assert isinstance(self.config, RecsysAttentionConfig)
         assert not self.config.causal, "CuTeDSL FA4 does not support causal attention"
         has_cap = self.config.attn_logit_cap > 0 and self.config.attn_logit_cap_method != "none"
@@ -210,6 +212,28 @@ class CutedslRankerAttention(CustomAttention):
         sm_scale = self.scale_config.attn_output_scale(self.config.key_size)
         cap = config.attn_logit_cap if has_cap else -1.0
         cap_method = config.attn_logit_cap_method
+
+        if "own_key" in kwargs:
+            assert not has_cap, "Candidate-only attention has no logit cap"
+            from xrex.cutedsl.ranker_attention_candidate_only_fa4 import (
+                ranker_attention_candidate_only_fa4,
+            )
+
+            def candidate_only_mha(q, k, v, segment_ids, segment_ids_k, temp, own_key, own_value):
+                del segment_ids_k, temp
+                hist_valid_len = jnp.sum(
+                    segment_ids[:, : k.shape[1]] == 1, axis=-1, dtype=jnp.int32
+                )
+                out = ranker_attention_candidate_only_fa4(
+                    q, k, v, own_key, own_value, hist_valid_len, sm_scale
+                )
+                return out, None
+
+            kv_head_axes = ("batch_attn", "replicated", "kv_head", "hidden")
+            return candidate_only_mha, (
+                ("own_key", lambda s: NamedShape(s, kv_head_axes)),
+                ("own_value", lambda s: NamedShape(s, kv_head_axes)),
+            )
 
         from xrex.cutedsl.ranker_attention_fa4 import (
             build_dense_block_sparse_layout,
@@ -243,28 +267,34 @@ class CutedslRankerAttention(CustomAttention):
 
 
 class CutedslRankerVarlenAttention(CustomAttention):
+    supports_candidate_only = True
+
     def sharded_custom_op_with_extra_args(self, **kwargs):
         assert isinstance(self.config, RecsysAttentionConfig)
         assert not self.config.causal, "CuTeDSL FA4 does not support causal attention"
-        assert self.config.attn_logit_cap <= 0, (
-            "The packed CuTeDSL FA4 wrapper does not wire the attn_logit_cap score_mod "
-            f"(got attn_logit_cap={self.config.attn_logit_cap}); use qk_norm=True, or "
-            "cutedsl_ranker_attn for a capped model"
+        has_cap = self.config.attn_logit_cap > 0 and self.config.attn_logit_cap_method != "none"
+        assert self.config.qk_norm or has_cap, (
+            "CuTeDSL FA4 needs logit stabilisation: qk_norm=True or attn_logit_cap > 0"
         )
-        assert self.config.qk_norm, "CuTeDSL FA4 requires qk_norm=True for stable training"
         from xrex.utils.gpu import GpuArch, gpu_arch
 
         arch = gpu_arch()
         assert arch in (GpuArch.A100, GpuArch.H100, GpuArch.GB200, GpuArch.GB300), (
             f"CuTeDSL ranker varlen attention requires A100, H100, GB200 or GB300 (got {arch})"
         )
+        assert not (has_cap and arch == GpuArch.A100), (
+            "CuTeDSL FA4 attn_logit_cap is SM90/SM100 only (SM80 rejects score_mod with block "
+            "sparsity); use qk_norm=True with attn_logit_cap=-1 on A100"
+        )
         sm_scale = self.scale_config.attn_output_scale(self.config.key_size)
+        cap = self.config.attn_logit_cap if has_cap else -1.0
+        cap_method = self.config.attn_logit_cap_method
 
+        from xrex.cutedsl.ranker_attention_varlen_candidate_packed_fa4 import (
+            ranker_attention_varlen_candidate_packed_fa4,
+        )
         from xrex.cutedsl.ranker_attention_varlen_fa4 import (
             ranker_attention_varlen_fa4,
-        )
-        from xrex.cutedsl.ranker_candidate_attention_fa4 import (
-            ranker_candidate_attention_fa4,
         )
 
         def sharded_mha(
@@ -308,10 +338,13 @@ class CutedslRankerVarlenAttention(CustomAttention):
                 bsp_bwd_diag_idx,
             )
             if candidate_region_args:
+                assert cap <= 0, (
+                    "attn_logit_cap is not supported with seqpack_candidate_packing=True"
+                )
                 candidate_cu_seqlens, candidate_token_to_slot, key_starts, key_counts = (
                     candidate_region_args
                 )
-                attn_out = ranker_candidate_attention_fa4(
+                attn_out = ranker_attention_varlen_candidate_packed_fa4(
                     q,
                     k,
                     v,
@@ -333,11 +366,34 @@ class CutedslRankerVarlenAttention(CustomAttention):
                     block_sparse_layout=(fwd_bs, bwd_bs),
                     valid_block_upper=bsp_valid_block_upper,
                     valid_block_lower=bsp_valid_block_lower,
+                    cap=cap,
+                    cap_method=cap_method,
                 )
             return attn_out, None
 
         def _rep(s):
             return NamedShape(s, ("batch_attn",) + tuple("replicated" for _ in s[1:]))
+
+        if "own_key" in kwargs:
+            assert not has_cap, "Candidate-only attention has no logit cap"
+            from xrex.cutedsl.ranker_attention_candidate_only_fa4 import (
+                ranker_attention_varlen_candidate_only_fa4,
+            )
+
+            def candidate_only_mha(q, k, v, segment_ids, segment_ids_k, temp, *candidate_only_args):
+                del segment_ids, segment_ids_k, temp
+                assert q.shape[0] == 1, "Seqpack varlen attention expects one packed row per shard."
+                row_args = (x[0] for x in (q, k, v, *candidate_only_args))
+                return ranker_attention_varlen_candidate_only_fa4(*row_args, sm_scale)[None], None
+
+            kv_head_axes = ("batch_attn", "replicated", "kv_head", "hidden")
+            return candidate_only_mha, (
+                ("own_key", lambda s: NamedShape(s, kv_head_axes)),
+                ("own_value", lambda s: NamedShape(s, kv_head_axes)),
+                ("candidate_cu_seqlens", _rep),
+                ("candidate_key_starts", _rep),
+                ("candidate_key_counts", _rep),
+            )
 
         bsp_names = (
             "bsp_fwd_mask_cnt",

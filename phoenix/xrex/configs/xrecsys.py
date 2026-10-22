@@ -18,6 +18,7 @@ from xrex.data.recsys.feature_config import (
 )
 from xrex.data.recsys.recsys_batch import EMBEDDING_CONFIG
 from xrex.data.recsys.sequence_packing import BetaLengthDistribution
+from xrex.models.page_rl import PAGE_PARAM_REGEX, PageRlConfig
 from xrex.models.recsys_attention import RecsysAttentionConfig
 from xrex.models.recsys_embedding import HashKeys, HashTable
 from xrex.models.recsys_feature_prep import FeaturePrepConfig
@@ -92,6 +93,7 @@ def _make_feature_prep_config(mparams: dict, scale_config: ScaleConfig) -> Featu
         sid_cross_attn=mparams.get("sid_cross_attn", False),
         sid_embedding_mode=mparams.get("sid_embedding_mode", "learned"),
         sid_decoder_path=mparams.get("sid_decoder_path", ""),
+        sid_recon_rows_per_decoder_pass=mparams.get("sid_recon_rows_per_decoder_pass", 16384),
         enable_stale_post=mparams.get("enable_stale_post", False),
     )
 
@@ -203,6 +205,7 @@ def _make_dataset(
     _sid_num_levels = mparams.get("sid_num_levels", 6)
     _enable_stale_post = mparams.get("enable_stale_post", False)
     _ads_head_masking = mparams.get("ads_head_masking", False)
+    _ads_pixel_head_masking = mparams.get("ads_pixel_head_masking", False)
 
     match dataset_type:
         case "aggregated_kafka":
@@ -221,6 +224,7 @@ def _make_dataset(
                 sid_num_levels=_sid_num_levels,
                 enable_stale_post=_enable_stale_post,
                 ads_head_masking=_ads_head_masking,
+                ads_pixel_head_masking=_ads_pixel_head_masking,
             )
         case "toy_dataset":
             return PhoenixToyDataset(
@@ -229,6 +233,7 @@ def _make_dataset(
                 history_seq_len=mparams["history_seq_len"],
                 candidate_seq_len=mparams["candidate_seq_len"],
                 input_vocab_size=mparams["input_vocab_size"],
+                output_vocab_size=mparams["output_vocab_size"],
                 num_continuous_actions=mparams["num_continuous_actions"],
                 num_negatives_per_example=mparams.get("num_negatives_per_example", 1),
                 multimodal_embedding_type=mparams.get("multimodal_embedding_type"),
@@ -236,6 +241,7 @@ def _make_dataset(
                 sid_num_levels=_sid_num_levels,
                 enable_stale_post=_enable_stale_post,
                 ads_head_masking=_ads_head_masking,
+                ads_pixel_head_masking=_ads_pixel_head_masking,
             )
         case _:
             raise ValueError(f"Uknown {dataset_type=}, must be one of {DATASET_TYPES}")
@@ -293,7 +299,7 @@ def _home_direct_packed_base() -> dict:
             enable_user_location=True,
             enable_user_gender=True,
             enable_user_age=True,
-            enable_user_installed_apps=True,
+            enable_user_installed_apps=False,
             enable_product_surface=True,
             enable_post_age=True,
             enable_timezone=True,
@@ -326,7 +332,6 @@ _H100_OVERRIDES = {
     "num_microbatch": 2,
     "ep": 128,
     "use_async_emb": True,
-    "seqpack_drop_empty_candidates": True,
     "overlap_step_host_work": True,
     "remat_policy": RematType.SAVE_H100_QKV_ATTN_FFN,
     "unroll_layer_stack": True,
@@ -381,6 +386,37 @@ _GB300_OVERRIDES = {
 }
 
 
+def _immersive_page_rl() -> dict:
+    base = {**_home_direct_packed_base(), **_H100_OVERRIDES}
+    return {
+        **base,
+        "bs_per_device": 256,
+        "num_microbatch": 1,
+        "overlap_step_host_work": False,
+        "remat_policy": RematType.WHOLE,
+        "unroll_layer_stack": False,
+        "dwell_tweedie_loss_weight": 0.1,
+        "dwell_mae_loss_weight": 0.1,
+        "dwell_cread_loss_weight": 0.0,
+        "dwell_cread_immersive_loss_weight": 0.0,
+        "ep": 128,
+        "attn_impl": "pallas_ranker_varlen_attn",
+        "attn_logit_cap": 80.0,
+        "click_dwell_loss_weight": 0.0,
+        "compute_post_unexplored_label": False,
+        "feature_prep": replace(
+            base["feature_prep"], enable_click_dwell_time=False, enable_dwell_bucket_table=False
+        ),
+        "optim_config": replace(
+            base["optim_config"], clip_partitions=[PAGE_PARAM_REGEX], muon_ns_shard_group_size=1
+        ),
+        "emb_optim_config": RecsysEmbeddingOptimConfig(
+            rowwise_adagrad=replace(base["emb_optim_config"].rowwise_adagrad, learning_rate=0.198),
+        ),
+        "page_rl": PageRlConfig(enabled=True),
+    }
+
+
 MODEL_CFGS = {
     "xrecsys_seqpack": _make_cfg(
         {
@@ -425,7 +461,12 @@ MODEL_CFGS = {
         ip_vocab_size=10_000_000,
     ),
     "home_direct_packed": _make_cfg(
-        {**_home_direct_packed_base(), **_H100_OVERRIDES},
+        {
+            **_home_direct_packed_base(),
+            **_H100_OVERRIDES,
+            "seqpack_candidate_packing": True,
+            "seqpack_candidate_count": [32, 128],
+        },
         user_vocab_size=100_000_000,
         item_vocab_size=100_000_000,
         author_vocab_size=30_000_000,
@@ -433,6 +474,13 @@ MODEL_CFGS = {
     ),
     "home_direct_packed_gb300": _make_cfg(
         {**_home_direct_packed_base(), **_GB300_OVERRIDES},
+        user_vocab_size=100_000_000,
+        item_vocab_size=100_000_000,
+        author_vocab_size=30_000_000,
+        ip_vocab_size=10_000_000,
+    ),
+    "immersive_page_rl": _make_cfg(
+        _immersive_page_rl(),
         user_vocab_size=100_000_000,
         item_vocab_size=100_000_000,
         author_vocab_size=30_000_000,
@@ -552,10 +600,7 @@ class _ConfigRegistry(dict[str, RecsysTrainer]):
 CONFIGS: dict[str, RecsysTrainer] = _ConfigRegistry()
 
 
-for config in configs:
-    config_name, mparams = config["config_name__mparams"]
-    assert isinstance(mparams, dict)
-    dataset_type = config["dataset_type"]
+def make_trainer(config_name: str, mparams: dict, dataset_type: str) -> RecsysTrainer:
     config_name_gen = f"{config_name}_{dataset_type}"
 
     if dataset_type == "grpc_recsys" and mparams.get("enable_stale_post", False):
@@ -633,7 +678,7 @@ for config in configs:
 
     _validate_params(mparams, num_user_prefix_tokens)
 
-    CONFIGS[config_name_gen] = RecsysTrainer(
+    return RecsysTrainer(
         name=config_name_gen,
         precision_level=2,
         reuse_run_id=False,
@@ -668,9 +713,14 @@ for config in configs:
                 "mask_candidate_positive_when_negative_action_present", False
             ),
             ads_head_masking=mparams.get("ads_head_masking", False),
+            ads_pixel_head_masking=mparams.get("ads_pixel_head_masking", False),
             enable_dpa_input_embedding=mparams.get("enable_dpa_input_embedding", False),
             attend_padded_history=mparams.get("attend_padded_history", False),
+            pad_candidates_to_128=mparams.get("pad_candidates_to_128", True),
             concat_history_bridge_prob=mparams.get("concat_history_bridge_prob", False),
+            concat_history_web_conv_time_on_site=mparams.get(
+                "concat_history_web_conv_time_on_site", False
+            ),
             mact_in_app_loss_weight=mparams.get("mact_in_app_loss_weight", 1.0),
             purchase_value_loss_weight=mparams.get("purchase_value_loss_weight", 0.0),
             purchase_value_huber_delta=mparams.get("purchase_value_huber_delta", 1.0),
@@ -689,6 +739,7 @@ for config in configs:
             candidate_seq_len=mparams["candidate_seq_len"],
             pad_token=PAD_TOKEN,
             act_l2_weight=5e-7,
+            page_rl=mparams.get("page_rl", PageRlConfig()),
             num_continuous_actions=mparams["num_continuous_actions"],
             continuous_action_losses=[
                 ContinuousActionLossConfig(
@@ -881,6 +932,7 @@ for config in configs:
                 remat_policy=mparams.get("remat_policy", RematType.WHOLE),
                 use_layer_stack=True,
                 unroll_layer_stack=mparams.get("unroll_layer_stack", False),
+                candidate_only_layers=tuple(mparams.get("candidate_only_layers", ())),
                 output_vocab_size=mparams["output_vocab_size"],
             ),
             hash_table=hash_table,
@@ -888,8 +940,11 @@ for config in configs:
         bs_per_device=mparams["bs_per_device"],
         num_microbatch=mparams.get("num_microbatch", 1),
         use_async_emb=mparams.get("use_async_emb", False),
+        use_row_emb=mparams.get("use_row_emb", False),
+        row_emb_recv_factor=mparams.get("row_emb_recv_factor", 2.0),
         overlap_step_host_work=mparams.get("overlap_step_host_work", False),
-        seqpack_drop_empty_candidates=mparams.get("seqpack_drop_empty_candidates", False),
+        seqpack_candidate_packing=mparams.get("seqpack_candidate_packing", False),
+        seqpack_candidate_count=mparams.get("seqpack_candidate_count", []),
         seqpack_distribution=seqpack_distribution,
         dataset=dataset,
         parallel_config=ParallelConfig(
@@ -933,6 +988,13 @@ for config in configs:
             checkpoint_disk_every_s=600,
         ),
     )
+
+
+for config in configs:
+    config_name, mparams = config["config_name__mparams"]
+    assert isinstance(mparams, dict)
+    dataset_type = config["dataset_type"]
+    CONFIGS[f"{config_name}_{dataset_type}"] = make_trainer(config_name, mparams, dataset_type)
 
 for _apply_config_overrides in config_registry.RANKING_CONFIG_HOOKS:
     _apply_config_overrides(CONFIGS)

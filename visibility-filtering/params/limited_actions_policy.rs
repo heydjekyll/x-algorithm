@@ -1,5 +1,5 @@
-use crate::limited_actions_copy::{Prompt, PromptCopy};
 use crate::models::LimitedEngagementReason;
+use crate::params::limited_actions_copy::{Prompt, PromptCopy};
 use xai_feature_switches::FeatureSwitchResults;
 use xai_stats_receiver::StatsReceiverExt;
 
@@ -12,7 +12,7 @@ const MISSING_POLICY_COUNTER: &str = "limited_actions_policy_missing";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, strum::EnumString)]
 #[strum(serialize_all = "snake_case")]
-pub(crate) enum LimitedActionType {
+pub enum LimitedActionType {
     Reply,
     Retweet,
     QuoteTweet,
@@ -138,7 +138,7 @@ impl LimitedActionsPolicies {
 mod tests {
     use super::super::tests::Counted;
     use super::*;
-    use crate::limited_actions_copy::LimitedActionsCopy;
+    use crate::params::limited_actions_copy::LimitedActionsCopy;
     use crate::params::ClientSwitches;
     use arc_swap::ArcSwap;
     use std::collections::BTreeMap;

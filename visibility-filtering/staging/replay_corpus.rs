@@ -1,12 +1,13 @@
-use crate::filter::{FilterRequest, FilterTweets};
 use crate::hydration::request_context;
 use crate::hydration::sources::Id;
-use crate::models::{ClientCapability, RawCandidate, TweetId};
-use crate::retweet;
+use crate::models::viewer::Client;
+use crate::models::{ClientCapability, Placement, TweetId};
+use crate::post_evaluator::{PostBatch, PostEvaluator};
+use crate::quote::{QuotePassMode, QuotePassRunner};
+use crate::result_label::{Label, quote_label};
 use crate::rules::SafetyLevel;
-use crate::rules::metrics::Rpc;
 use crate::staging::recording::Recording;
-use crate::staging::reference::tweetypie::{Client, Label, vf_label};
+use crate::staging::reference::tweetypie::vf_label;
 use crate::treatment;
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
@@ -34,16 +35,33 @@ pub(crate) struct Case {
 #[derive(Debug, Serialize, Deserialize)]
 pub(crate) struct Expected {
     pub(crate) tweet_id: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) quote_context: Option<QuoteContext>,
         pub(crate) tags: Vec<String>,
     pub(crate) tweetypie: Label,
         pub(crate) vf: Label,
     pub(crate) vf_rule: Option<String>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub(crate) struct QuoteContext {
+    pub(crate) outer_tweet_id: u64,
+}
+
+pub(crate) fn placement(quote_context: Option<QuoteContext>) -> Placement {
+    match quote_context {
+        None => Placement::Standalone,
+        Some(quote) => Placement::InnerQuoted {
+            outer: TweetId(quote.outer_tweet_id),
+        },
+    }
+}
+
 pub(crate) struct Evaluated {
     pub(crate) tweet_id: u64,
+    pub(crate) placement: Placement,
     pub(crate) label: Label,
-    pub(crate) rule: Option<&'static str>,
+    pub(crate) rule: Option<(SafetyLevel, &'static str)>,
 }
 
 pub(crate) struct Fixtures {
@@ -104,38 +122,36 @@ impl Fixtures {
     }
 }
 
-pub(crate) async fn evaluate(
-    filter_tweets: &FilterTweets,
-    viewer_id: Option<u64>,
-    country_code: Option<String>,
-    client_capability: ClientCapability,
-    tweet_ids: &[u64],
-) -> Vec<Evaluated> {
-    let candidates = tweet_ids
-        .iter()
-        .map(|&tweet_id| RawCandidate {
-            tweet_id: TweetId(tweet_id),
-            request_author_id: None,
+pub(crate) async fn evaluate(post_evaluator: &PostEvaluator, request: PostBatch) -> Vec<Evaluated> {
+    let level = request.safety_level;
+    let (outcomes, passes) = request_context(Instant::now(), None)
+        .scope(async {
+            let (outcomes, pending) = QuotePassRunner::new(QuotePassMode::Shadow)
+                .serve(post_evaluator, request)
+                .await;
+            let passes = pending.run(post_evaluator, &outcomes).await;
+            (outcomes, passes)
         })
-        .collect();
-    let request = FilterRequest {
-        viewer_id,
-        country_code,
-        client_capability,
-        safety_level: SafetyLevel::TimelineHomeHydration,
-        candidates,
-        rpc: Rpc::EvaluateTweets,
-    };
-    request_context(Instant::now(), None)
-        .scope(retweet::evaluate_merging_sources(filter_tweets, request))
-        .await
+        .await;
+    outcomes
         .iter()
-        .map(|outcome| Evaluated {
-            tweet_id: outcome.tweet_id.0,
-            label: vf_label(outcome),
-            rule: treatment::decided_rows(outcome.evaluation.verdict())
-                .next()
-                .map(|(rule, _)| rule),
+        .map(|outcome| {
+            let served = vf_label(outcome, level);
+            let rule =
+                treatment::decided_by(outcome.evaluation.verdict()).map(|rule| (level, rule));
+            let (label, rule) = match passes.ran().iter().find(|pass| pass.key == outcome.key()) {
+                None => (served, rule),
+                Some(pass) => (
+                    quote_label(pass.outcome.rendering(), served),
+                    pass.decided_by(rule),
+                ),
+            };
+            Evaluated {
+                tweet_id: outcome.tweet_id.0,
+                placement: outcome.placement,
+                label,
+                rule,
+            }
         })
         .collect()
 }
@@ -143,10 +159,15 @@ pub(crate) async fn evaluate(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::metrics::Rpc;
+    use crate::models::PlacedCandidate;
     use crate::params::{CountryList, CountryLists};
+    use crate::pinned::crate_path;
+    use crate::result_label::{Class, renders_alike};
     use crate::rules::RuleEngine;
+    use crate::scenario::raw;
     use crate::staging::recording::Replay;
-    use crate::staging::reference::tweetypie::Class;
+    use crate::staging::reference::tweetypie::SAFETY_LEVEL;
     use serde::de::DeserializeOwned;
     use std::collections::BTreeMap;
     use std::io::Write;
@@ -154,47 +175,69 @@ mod tests {
     use std::sync::Arc;
 
     const CORPUS: &str = "tests/replay_corpus";
-                const SCREENED_DROPS: [&str; 9] = [
-        "tweet_is_bounced",
-        "author_block_viewer",
-        "author_is_protected",
-        "author_is_suspended",
-        "exclusive_tweet",
-        "nsfw_viewer_is_underage",
-        "nsfw_viewer_has_no_stated_age",
-        "nsfw_logged_out",
-        "premium_tweet",
-    ];
+    type Entry = (String, u64, Option<QuoteContext>);
 
-    fn renders_alike(vf: &Label, tweetypie: &Label) -> bool {
-        vf == tweetypie
-            || (vf.0 == <&str>::from(Class::BareDrop)
-                && tweetypie.0 == <&str>::from(Class::Drop)
-                && !SCREENED_DROPS.contains(&tweetypie.1.as_str()))
+    fn entry_name((case, tweet_id, quote): &Entry) -> String {
+        match quote {
+            None => format!("{case}/{tweet_id}"),
+            Some(quote) => format!("{case}/{tweet_id} quoted in {}", quote.outer_tweet_id),
+        }
     }
 
     #[derive(Deserialize)]
-    struct KnownDivergence {
-        case: String,
-        tweet_id: u64,
-                vf: Label,
-        reason: String,
+    #[serde(rename_all = "snake_case")]
+    enum Kind {
+        Deliberate,
+        Gap,
     }
 
-            fn corpus_dir() -> PathBuf {
+        #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Divergence {
+        divergence: String,
+        kind: Kind,
+        #[serde(default)]
+        ticket: Option<String>,
+        behavior: String,
+        #[serde(default)]
+        replay: Vec<Pin>,
+    }
+
+        #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Pin {
+        case: String,
+        tweet_id: u64,
+        #[serde(default)]
+        quote_context: Option<QuoteContext>,
+                vf: Label,
+    }
+
+    impl Pin {
+        fn entry(&self) -> Entry {
+            (self.case.clone(), self.tweet_id, self.quote_context)
+        }
+    }
+
+    fn registry() -> Vec<Divergence> {
+        read(&crate_path("tests/divergences.json"))
+    }
+
+        fn known_divergences() -> Vec<(String, Pin)> {
+        registry()
+            .into_iter()
+            .flat_map(|entry| {
+                let name = entry.divergence;
+                entry.replay.into_iter().map(move |pin| (name.clone(), pin))
+            })
+            .collect()
+    }
+
+                fn corpus_dir() -> PathBuf {
         if let Some(dir) = std::env::var_os("VF_REPLAY_CORPUS") {
             return dir.into();
         }
         crate_path(CORPUS)
-    }
-
-    fn crate_path(path: &str) -> PathBuf {
-        let cargo = Path::new(env!("CARGO_MANIFEST_DIR")).join(path);
-        if cargo.exists() {
-            cargo
-        } else {
-            Path::new("crates/x-product/xai-visibility-filtering-service").join(path)
-        }
     }
 
     fn read<T: DeserializeOwned>(path: &Path) -> T {
@@ -224,94 +267,52 @@ mod tests {
         stored(dir).into_iter().map(|stored| stored.case).collect()
     }
 
-            const DECIDED_AT_LEAST: [&str; 64] = [
-        "author_blocks_viewer_exclusive_content/drop/unspecified",
-        "blocked_viewer/limited_engagement",
-        "blocked_viewer/limited_engagement/root_author_blocked_viewer",
-        "bounce/drop/bounced",
-        "creator_tweet_nsfw/drop/nsfw_media",
-        "deactivated_author/drop",
-        "exclusive_tweet/drop",
-        "fosnr_abuse/drop/undesirable",
-        "fosnr_abuse_insults_non_follower/drop/undesirable",
-        "fosnr_author/appealable",
-        "fosnr_civic_integrity/drop/undesirable",
-        "fosnr_fallback/drop/undesirable",
-        "fosnr_hateful_conduct/drop/undesirable",
-        "fosnr_violent_speech/drop/undesirable",
-        "gore_and_violence_high_precision/blur",
-        "gore_and_violence_high_precision/legacy_interstitial",
-        "gore_and_violence_high_precision/tombstone/update_app_android",
-        "gore_and_violence_high_precision/tombstone/update_app_ios",
-        "gore_and_violence_ignoring_settings/blur",
-        "gore_and_violence_reported_heuristics/blur/sensitive",
-        "gore_and_violence_reported_heuristics/legacy_interstitial",
-        "limit_replies_by_invitation/limited_engagement/conversation_control",
-        "limit_replies_co/limited_engagement/conversation_control",
-        "limit_replies_community/limited_engagement/conversation_control",
-        "limit_replies_my_network/limited_engagement/conversation_control",
-        "limit_replies_subscribers/limited_engagement/conversation_control",
-        "limit_replies_verified/limited_engagement/conversation_control",
-        "nsfw_account/legacy_interstitial",
-        "nsfw_account/tombstone/age_verification",
-        "nsfw_account/tombstone/update_app_android",
-        "nsfw_account/tombstone/update_app_ios",
-        "nsfw_admin/blur/sensitive",
-        "nsfw_admin/blur/sensitive/age_prompt",
-        "nsfw_card_image/blur/sensitive",
-        "nsfw_card_image/blur/sensitive/age_prompt",
-        "nsfw_card_image/legacy_interstitial",
-        "nsfw_card_image/tombstone/age_verification",
-        "nsfw_card_image/tombstone/update_app_android",
-        "nsfw_card_image/tombstone/update_app_ios",
-        "nsfw_high_precision/blur/nudity",
-        "nsfw_high_precision/blur/nudity/age_prompt",
-        "nsfw_high_precision/legacy_interstitial",
-        "nsfw_high_precision/tombstone/age_verification",
-        "nsfw_high_precision/tombstone/local_regulations",
-        "nsfw_high_precision/tombstone/update_app_android",
-        "nsfw_high_precision/tombstone/update_app_ios",
-        "nsfw_reported_heuristics/blur/sensitive",
-        "nsfw_reported_heuristics/blur/sensitive/age_prompt",
-        "nsfw_reported_heuristics/legacy_interstitial",
-        "nsfw_reported_heuristics/tombstone/age_verification",
-        "nsfw_reported_heuristics/tombstone/update_app_android",
-        "nsfw_reported_heuristics/tombstone/update_app_ios",
-        "nsfw_user/blur/sensitive_user",
-        "nsfw_user/blur/sensitive_user/age_prompt",
-        "offboarded_author/drop/inactive",
-        "pdna/drop/safety_result",
-        "protected_author/drop",
-        "read_only_viewer/limited_engagement",
-        "sensitive_viewer_logged_out/drop",
-        "sensitive_viewer_no_stated_age/drop",
-        "sensitive_viewer_underage/drop",
-        "spam/drop/undesirable",
-        "stale_tweet/limited_engagement",
-        "suspended_author/drop",
-    ];
+    type LevelRule = (&'static str, &'static str);
+
+    #[derive(Clone, Copy, PartialEq, strum::IntoStaticStr)]
+    #[strum(serialize_all = "snake_case")]
+    enum Coverage {
+        Decided,
+        Diverging,
+        Unreachable,
+        Unlisted,
+    }
+
+    fn level_rule((level, rule): (SafetyLevel, &'static str)) -> LevelRule {
+        (level.into(), rule)
+    }
 
     struct Replayed {
         failures: Vec<String>,
-                decided: BTreeSet<&'static str>,
-                diverging: BTreeSet<&'static str>,
+                decided: BTreeSet<LevelRule>,
+                diverging: BTreeSet<LevelRule>,
+                mismatched: BTreeSet<Entry>,
     }
 
     async fn replay_cases(dir: &Path) -> Replayed {
-        let divergences: Vec<KnownDivergence> = read(&dir.join("known_divergences.json"));
+        replay_stored(dir, stored(dir)).await
+    }
+
+    async fn replay_stored(dir: &Path, cases: Vec<Stored>) -> Replayed {
+        let divergences = known_divergences();
         let shared: Recording = read(&dir.join("shared.json"));
         let shared_lists: BTreeMap<CountryList, Vec<String>> =
             read(&dir.join("country_lists.json"));
         let mut failures = Vec::new();
         let mut decided = BTreeSet::new();
         let mut diverging = BTreeSet::new();
+        let mut mismatched = BTreeSet::new();
         let mut replayed = Vec::new();
         for Stored {
             case,
             country_lists,
-        } in stored(dir)
+        } in cases
         {
-            replayed.extend(case.tweets.iter().map(|t| (case.id.clone(), t.tweet_id)));
+            replayed.extend(
+                case.tweets
+                    .iter()
+                    .map(|t| (case.id.clone(), t.tweet_id, t.quote_context)),
+            );
             let recording = case.recording.with_shared(&shared);
             let sources = match recording.into_replay(case.viewer_id) {
                 Ok(sources) => Arc::new(sources),
@@ -323,19 +324,27 @@ mod tests {
             let country_lists =
                 CountryLists::from_codes(country_lists.as_ref().unwrap_or(&shared_lists))
                     .unwrap_or_else(|e| panic!("{}: {e}", case.id));
-            let filter_tweets = FilterTweets::new(
+            let post_evaluator = PostEvaluator::new(
                 Arc::<Replay>::clone(&sources),
                 RuleEngine::with_country_lists(Arc::new(country_lists)),
+                Arc::default(),
             );
-            let tweet_ids: Vec<u64> = case.tweets.iter().map(|t| t.tweet_id).collect();
-            let evaluated = evaluate(
-                &filter_tweets,
-                case.viewer_id,
-                case.country_code,
-                case.client_capability,
-                &tweet_ids,
-            )
-            .await;
+            let request = PostBatch {
+                viewer_id: case.viewer_id,
+                country_code: case.country_code,
+                client_capability: case.client_capability,
+                safety_level: SAFETY_LEVEL,
+                candidates: case
+                    .tweets
+                    .iter()
+                    .map(|t| PlacedCandidate {
+                        candidate: raw(t.tweet_id, None),
+                        placement: placement(t.quote_context),
+                    })
+                    .collect(),
+                rpc: Rpc::EvaluateTweets,
+            };
+            let evaluated = evaluate(&post_evaluator, request).await;
             let misses = sources.misses();
             if !misses.is_empty() {
                 failures.push(format!(
@@ -345,34 +354,40 @@ mod tests {
                 continue;
             }
             for expected in &case.tweets {
-                let Some(vf) = evaluated.iter().find(|vf| vf.tweet_id == expected.tweet_id) else {
-                    failures.push(format!("{}/{}: no outcome", case.id, expected.tweet_id));
+                let entry = (case.id.clone(), expected.tweet_id, expected.quote_context);
+                let key = entry_name(&entry);
+                let Some(vf) = evaluated.iter().find(|vf| {
+                    vf.tweet_id == expected.tweet_id
+                        && vf.placement == placement(expected.quote_context)
+                }) else {
+                    failures.push(format!("{key}: no outcome"));
                     continue;
                 };
-                let known = divergences
-                    .iter()
-                    .find(|d| d.case == case.id && d.tweet_id == expected.tweet_id);
-                let key = format!("{}/{}", case.id, expected.tweet_id);
+                let known = divergences.iter().find(|(_, pin)| pin.entry() == entry);
                 match (renders_alike(&vf.label, &expected.tweetypie), known) {
-                    (true, None) => decided.extend(vf.rule),
-                    (false, Some(known)) if vf.label == known.vf => diverging.extend(vf.rule),
-                    (false, Some(known)) => failures.push(format!(
-                        "{key}: vf {:?} by {:?}, its known divergence pins {:?} ({})",
-                        vf.label, vf.rule, known.vf, known.reason
+                    (true, None) => decided.extend(vf.rule.map(level_rule)),
+                    (false, Some((_, pin))) if vf.label == pin.vf => {
+                        diverging.extend(vf.rule.map(level_rule));
+                    }
+                    (false, Some((divergence, pin))) => failures.push(format!(
+                        "{key}: vf {:?} by {:?}, its known divergence pins {:?} ({divergence})",
+                        vf.label, vf.rule, pin.vf
                     )),
-                    (false, None) => failures.push(format!(
-                        "{key} [{}; {}]: vf {:?} by {:?}, tweetypie {:?} (vf at capture {:?} by {:?})",
-                        case.tags.join(","),
-                        expected.tags.join(","),
-                        vf.label,
-                        vf.rule,
-                        expected.tweetypie,
-                        expected.vf,
-                        expected.vf_rule,
-                    )),
-                    (true, Some(known)) => failures.push(format!(
-                        "{key}: now matches tweetypie; remove its known divergence ({})",
-                        known.reason
+                    (false, None) => {
+                        failures.push(format!(
+                            "{key} [{}; {}]: vf {:?} by {:?}, tweetypie {:?} (vf at capture {:?} by {:?})",
+                            case.tags.join(","),
+                            expected.tags.join(","),
+                            vf.label,
+                            vf.rule,
+                            expected.tweetypie,
+                            expected.vf,
+                            expected.vf_rule,
+                        ));
+                        mismatched.insert(entry);
+                    }
+                    (true, Some((divergence, _))) => failures.push(format!(
+                        "{key}: now matches tweetypie; remove its known divergence ({divergence})"
                     )),
                 }
             }
@@ -380,11 +395,12 @@ mod tests {
         failures.extend(
             divergences
                 .iter()
-                .filter(|d| !replayed.contains(&(d.case.clone(), d.tweet_id)))
-                .map(|d| {
+                .map(|(_, pin)| pin.entry())
+                .filter(|entry| !replayed.contains(entry))
+                .map(|entry| {
                     format!(
-                        "{}/{}: known divergence names no replayed tweet",
-                        d.case, d.tweet_id
+                        "{}: known divergence names no replayed tweet",
+                        entry_name(&entry)
                     )
                 }),
         );
@@ -392,34 +408,29 @@ mod tests {
             failures,
             decided,
             diverging,
+            mismatched,
         }
     }
 
-    fn wired_rules() -> Vec<&'static str> {
-        RuleEngine::for_tests().wired_rule_names(SafetyLevel::TimelineHomeHydration)
-    }
-
-    impl Replayed {
-                fn undecided(&self) -> Vec<&'static str> {
-            wired_rules()
-                .into_iter()
-                .filter(|rule| !self.decided.contains(rule))
-                .collect()
-        }
+    fn decidable_rules() -> Vec<LevelRule> {
+        let engine = RuleEngine::for_tests();
+        let mut rules: Vec<LevelRule> = [SAFETY_LEVEL, SafetyLevel::QuotedTweetRules]
+            .into_iter()
+            .flat_map(|level| {
+                engine
+                    .wired_rule_names(level)
+                    .into_iter()
+                    .map(move |rule| level_rule((level, rule)))
+            })
+            .collect();
+        rules.sort_unstable();
+        rules.dedup();
+        rules
     }
 
     #[tokio::test]
     async fn every_case_replays_to_tweetypies_answer() {
         let replayed = replay_cases(&corpus_dir()).await;
-        let wired = wired_rules();
-        let undecided = replayed.undecided();
-        let report = format!(
-            "replay corpus decides {} of {} level-82 rules\nreplay corpus leaves undecided: {}\n",
-            wired.len() - undecided.len(),
-            wired.len(),
-            undecided.join(", ")
-        );
-        std::io::stderr().write_all(report.as_bytes()).unwrap();
         assert!(
             replayed.failures.is_empty(),
             "\n{}",
@@ -427,46 +438,148 @@ mod tests {
         );
     }
 
+            const UNMATCHABLE: (&str, &str) = ("unmatchable", "no_rule_renders_this");
+
+    #[test]
+    fn each_entry_is_pinned_once_and_a_gap_names_its_ticket() {
+        let mut pinned = BTreeSet::new();
+        for divergence in registry() {
+            let name = &divergence.divergence;
+            assert!(!divergence.behavior.is_empty(), "{name}: no behavior");
+            if matches!(divergence.kind, Kind::Gap) {
+                assert!(
+                    divergence.ticket.is_some(),
+                    "{name}: a gap names its ticket"
+                );
+            }
+            for pin in &divergence.replay {
+                let entry = pin.entry();
+                assert!(
+                    pinned.insert(entry.clone()),
+                    "{}: pinned twice, again by {name}",
+                    entry_name(&entry)
+                );
+            }
+        }
+    }
+
     #[tokio::test]
-    async fn replay_corpus_decides_at_least() {
-        let decided = replay_cases(&corpus_dir()).await.decided;
-        let lost: Vec<&str> = DECIDED_AT_LEAST
-            .into_iter()
-            .filter(|rule| !decided.contains(rule))
-            .collect();
+    async fn every_replayed_pair_reaches_the_comparison() {
+        let dir = corpus_dir();
+        let divergences = known_divergences();
+        let mut cases = stored(&dir);
+        let mut unpinned = BTreeSet::new();
+        for stored in &mut cases {
+            for tweet in &mut stored.case.tweets {
+                tweet.tweetypie = (UNMATCHABLE.0.to_owned(), UNMATCHABLE.1.to_owned());
+                let entry = (stored.case.id.clone(), tweet.tweet_id, tweet.quote_context);
+                if !divergences.iter().any(|(_, pin)| pin.entry() == entry) {
+                    unpinned.insert(entry);
+                }
+            }
+        }
+
+        let mismatched = replay_stored(&dir, cases).await.mismatched;
+
+        let unreached: Vec<&Entry> = unpinned.difference(&mismatched).collect();
         assert!(
-            lost.is_empty(),
-            "the replay corpus no longer decides {lost:?}: a case deciding it was removed or no longer replays to Tweetypie's answer"
+            unreached.is_empty(),
+            "{} of {} unpinned pairs went unreported against a label no rule renders, first {:?}",
+            unreached.len(),
+            unpinned.len(),
+            &unreached[..unreached.len().min(5)]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_quote_entry_whose_tweetypie_label_flips_fails_naming_it_and_its_outer() {
+        let dir = corpus_dir();
+        let mut stored = stored(&dir)
+            .into_iter()
+            .find(|stored| stored.case.tweets.iter().any(|t| t.quote_context.is_some()))
+            .expect("the corpus holds a quote entry");
+        let case = stored.case.id.clone();
+        let quote = stored
+            .case
+            .tweets
+            .iter_mut()
+            .find(|t| t.quote_context.is_some())
+            .unwrap();
+        quote.tweetypie = (UNMATCHABLE.0.to_owned(), UNMATCHABLE.1.to_owned());
+        let entry = (case.clone(), quote.tweet_id, quote.quote_context);
+        let named = format!("{} [", entry_name(&entry));
+
+        let replayed = replay_stored(&dir, vec![stored]).await;
+
+        assert_eq!(replayed.mismatched, BTreeSet::from([entry]));
+        assert!(
+            replayed
+                .failures
+                .iter()
+                .any(|failure| failure.starts_with(&named)),
+            "no failure names {named}: {:?}",
+            replayed.failures
         );
     }
 
             #[tokio::test]
-    async fn every_level_82_rule_is_decided_diverging_or_unreachable() {
+    async fn every_decidable_rule_is_decided_diverging_or_unreachable() {
         #[derive(Deserialize)]
         struct Unreachable {
+            level: String,
             rule: String,
         }
         let replayed = replay_cases(&corpus_dir()).await;
         let unreachable: Vec<Unreachable> = read(&crate_path("scripts/corpus/unreachable.json"));
-        let listed = |rule: &str| unreachable.iter().any(|u| u.rule == rule);
-        let unlisted: Vec<&str> = replayed
-            .undecided()
-            .into_iter()
-            .filter(|rule| !replayed.diverging.contains(rule) && !listed(rule))
-            .collect();
-        let wired = wired_rules();
-        let stale: Vec<&str> = unreachable
+        let listed = |&(level, rule): &LevelRule| {
+            unreachable
+                .iter()
+                .any(|u| u.level == level && u.rule == rule)
+        };
+        let decidable = decidable_rules();
+        let state = |rule: &LevelRule| {
+            if replayed.decided.contains(rule) {
+                Coverage::Decided
+            } else if replayed.diverging.contains(rule) {
+                Coverage::Diverging
+            } else if listed(rule) {
+                Coverage::Unreachable
+            } else {
+                Coverage::Unlisted
+            }
+        };
+        let decided = decidable
             .iter()
-            .map(|u| u.rule.as_str())
+            .filter(|rule| state(rule) == Coverage::Decided)
+            .count();
+        let mut report = format!(
+            "replay corpus decides {decided} of {} level-82 and level-65 rules\n",
+            decidable.len()
+        );
+        report.extend(decidable.iter().map(|rule| {
+            let (level, name) = rule;
+            format!(
+                "replay corpus rule {:<11} {level:<23} {name}\n",
+                <&str>::from(state(rule))
+            )
+        }));
+        std::io::stderr().write_all(report.as_bytes()).unwrap();
+        let unlisted: Vec<&LevelRule> = decidable
+            .iter()
+            .filter(|rule| state(rule) == Coverage::Unlisted)
+            .collect();
+        let stale: Vec<(&str, &str)> = unreachable
+            .iter()
+            .map(|u| (u.level.as_str(), u.rule.as_str()))
             .filter(|rule| {
                 replayed.decided.contains(rule)
                     || replayed.diverging.contains(rule)
-                    || !wired.contains(rule)
+                    || !decidable.contains(rule)
             })
             .collect();
         assert!(
             unlisted.is_empty() && stale.is_empty(),
-            "level-82 rules no case decides or pins by a known divergence, missing from scripts/corpus/unreachable.json: {unlisted:?}\nunreachable.json rules a case decides, a known divergence pins or level 82 does not wire: {stale:?}"
+            "rules no case decides or pins by a known divergence, missing from scripts/corpus/unreachable.json: {unlisted:?}\nunreachable.json rules a case decides, a known divergence pins or neither level wires: {stale:?}"
         );
     }
 
@@ -523,14 +636,14 @@ mod tests {
         assert!(strangers.is_empty(), "not in fixtures.json: {strangers:?}");
     }
 
-            const NEVER_ALLOWED: [(&str, &str); 11] = [
-        (
-            "author:deactivated_author",
-            "Tweetypie drops a deactivated author's post for every viewer, the author included",
-        ),
+            const NEVER_ALLOWED: [(&str, &str); 24] = [
         (
             "creator_exclusive_image",
             "an NSFW-labeled subscribers-only image is dropped for every viewer but its author, who sees it blurred; vfcreatr's exclusive text post is the allowed control",
+        ),
+        (
+            "deactivated_author_post",
+            "Tweetypie drops a deactivated author's post for every viewer, the author included",
         ),
         (
             "erased_author_text",
@@ -549,8 +662,51 @@ mod tests {
             "every client gets a media treatment, a tombstone or an interstitial",
         ),
         (
+            "label_gore_and_violence_high_precision_image",
+            "as label_gore_and_violence_high_precision, and underage, logged-out and unstated-age NSFW-country viewers drop it",
+        ),
+        (
             "offboarded_author_text",
             "Tweetypie drops an offboarded author's post for every viewer",
+        ),
+        (
+            "qt_inner_deleted",
+            "its author deleted it, so Tweetypie answers it not found",
+        ),
+        ("qt_inner_deleted_blocker", "as qt_inner_deleted"),
+        ("qt_inner_erased", "as erased_author_text"),
+        ("qt_inner_offboarded", "as offboarded_author_text"),
+        (
+            "quoted_in:qt_of_blocker",
+            "the quoted author blocks the quoting author, which drops the quote for every viewer; quoted_in:qt_of_muted_followed is an allowed quote",
+        ),
+        (
+            "quoted_in:qt_of_bounced",
+            "a Bounce-labeled quote is dropped for other viewers and tombstoned for its author",
+        ),
+        (
+            "quoted_in:qt_of_deactivated_author",
+            "as deactivated_author_post, inside its quote",
+        ),
+        (
+            "quoted_in:qt_of_deleted",
+            "as qt_inner_deleted, inside its quote",
+        ),
+        (
+            "quoted_in:qt_of_deleted_blocker",
+            "the deleted quoted post's author blocks the quoting author, which drops the quote for every viewer; quoted_in:qt_of_deleted is its not-found control",
+        ),
+        (
+            "quoted_in:qt_of_erased",
+            "the quoted author is erased, which drops the quote for every viewer",
+        ),
+        (
+            "quoted_in:qt_of_offboarded",
+            "the quoted author is offboarded, which drops the quote for every viewer",
+        ),
+        (
+            "quoted_in:qt_of_protected",
+            "the quoting author does not follow the protected quoted author, which drops the quote for every viewer; quoted_in:qt_of_protected_by_follower is its allowed control",
         ),
         (
             "stale_original",
